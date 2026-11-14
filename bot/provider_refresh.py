@@ -2,7 +2,7 @@
 import json
 import urllib.request
 LEO=7414371088
-URL='http://100.116.56.44:9900/_ext/kanban-dispatcher'
+URL='http://10.10.0.10:9900/_ext/kanban-dispatcher'
 def valid(update):
     m=update.get('message',{})
     return (isinstance(update.get('update_id'),int) and not isinstance(update.get('update_id'),bool)

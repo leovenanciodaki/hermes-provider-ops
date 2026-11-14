@@ -17,14 +17,19 @@ def refresh(provider, cli='hermes', run=subprocess.run):
     if provider not in PROVIDERS: raise ValueError('Unsupported provider')
     # Native root semantics, without importing optional YAML into system Python.
     # Native root helper is stdlib-only and honors HERMES_HOME profile nesting.
-    native = Path(cli).resolve().parent
-    if (native/'hermes_constants.py').exists():
-        sys.path.insert(0,str(native))
+    for native in (Path(cli).parent.parent,Path(cli).resolve().parent,Path(cli).resolve().parent.parent):
+        if (native/'hermes_constants.py').exists():
+            sys.path.insert(0,str(native));break
     from hermes_constants import get_default_hermes_root
     root = get_default_hermes_root()
     names = ['default'] + sorted(p.name for p in (root/'profiles').iterdir() if p.is_dir() and (p/'config.yaml').exists()) if (root/'profiles').is_dir() else ['default']
     results = []
     for name in dict.fromkeys(names):
+        home=root if name=='default' else root/'profiles'/name
+        store=home/'auth.json'
+        local=json.loads(store.read_text()).get('credential_pool',{}).get(PROVIDERS[provider],[]) if store.exists() else []
+        if not local:
+            results.append({'profile':name,'status':'sem pool','error':''});continue
         argv = [cli,'--profile',name,'auth','reset',PROVIDERS[provider]]
         p = run(argv,capture_output=True,text=True,timeout=20)
         output = diagnostic(p.stderr or p.stdout)

@@ -208,7 +208,10 @@ class Dispatcher:
                 try:out=forward(u,self.token)
                 except Exception:out={'ok':False,'result':'manu: falhou:bridge unavailable\nmafe: falhou:bridge unavailable\nluna: falhou:bridge unavailable\naquario: falhou:bridge unavailable\ntanque: falhou:bridge unavailable'}
                 from provider_refresh import reply_text
-                self.send(reply_text(out,test=u.get('provider_ops_test') is True))
+                text=reply_text(out,test=u.get('provider_ops_test') is True)
+                edit=u.get('provider_ops_test_edit_message_id')
+                if u.get('provider_ops_test') is True and isinstance(edit,int):self.tg('editMessageText',{'chat_id':LEO,'message_id':edit,'text':text})
+                else:self.send(text)
             elif cmd in ('/status','/start'):out=self.sync()
             elif msg.get('reply_to_message'):
                 reply=msg['reply_to_message'];entry=self.s['messages'].get(str(reply.get('message_id')))

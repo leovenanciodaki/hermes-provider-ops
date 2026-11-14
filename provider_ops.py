@@ -11,7 +11,7 @@ import tempfile
 import threading
 import time
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 
 LEO = 7414371088
@@ -66,21 +66,57 @@ def telegram(token, text):
     if not result.get('ok'): raise RuntimeError('Telegram rejected notification')
     return result['result']['message_id']
 
+def installation_root(home):
+    home = Path(home)
+    if home.parent.name == 'profiles':
+        return home.parent.parent
+    return home
+
+
+def _merge_state(root, path):
+    state = {'checked': 0, 'sent': {}}
+    sources = [root/'provider-ops'/'state.json']
+    sources.extend(sorted((root/'profiles').glob('*/provider-ops/state.json')))
+    for source in sources:
+        if source.exists():
+            old = json.loads(source.read_text())
+            state['checked'] = max(state['checked'], old.get('checked', 0))
+            for key, mid in old.get('sent', {}).items():
+                state['sent'].setdefault(key, mid)
+    atomic(path, state)
+    return state
+
+
+def migrate_state(root):
+    """Merge installation and profile history without sending notifications."""
+    root = installation_root(root)
+    folder = root/'provider-ops'
+    folder.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with (folder/'state.lock').open('a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        return _merge_state(root, folder/'state.json')
+
+
+def _hash(parts):
+    return hashlib.sha256(json.dumps(parts).encode()).hexdigest()
+
+
 def check(home, token, *, fetch=fetch_usage, send=telegram, pools=None, thresholds=(85,95), test=False, interval=300, now=None):
-    """Injectable test helper. Overrides require test=True; returns actual message IDs."""
+    """Injectable helper; explicit test overrides use isolated state."""
     if not test and (thresholds != (85,95) or interval != 300):
         raise ValueError('Overrides require explicit test=True')
     if not token: return []
     if pools is None:
         from agent.credential_pool import load_pool
         pools = load_pool
-    folder = Path(home)/'provider-ops'
+    root = installation_root(home)
+    folder = root/'provider-ops'
     folder.mkdir(mode=0o700, parents=True, exist_ok=True)
     path = folder/('test-state.json' if test else 'state.json')
     ids = []
     with (folder/'state.lock').open('a') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
-        state = json.loads(path.read_text()) if path.exists() else {'checked':0,'sent':{}}
+        state = (json.loads(path.read_text()) if path.exists() else {'checked':0,'sent':{}}) if test else _merge_state(root, path)
         stamp = time.time() if now is None else now
         if stamp - state['checked'] < interval: return []
         state['checked'] = stamp
@@ -90,30 +126,54 @@ def check(home, token, *, fetch=fetch_usage, send=telegram, pools=None, threshol
                 try:
                     payload = fetch(provider,entry)
                     for name,pct,reset in windows(provider,payload):
+                        label = str(getattr(entry, 'label', '') or entry.id).replace('\n',' ')[:100]
+                        bucket = int((reset.timestamp() + 1800) // 3600)
+                        base = [provider, label, name, bucket]
+                        notified = []
                         for threshold in thresholds:
-                            identity = json.dumps([provider,entry.id,name,reset.isoformat(),threshold])
-                            key = hashlib.sha256(identity.encode()).hexdigest()
-                            if pct < threshold or key in state['sent']: continue
-                            label = str(entry.label).replace('\n',' ')[:100]
-                            text = f"{'TESTE ' if test else ''}{provider} · {label} · {name}: {pct:g}% (≥{threshold}%) · reset {reset.astimezone(ZoneInfo('America/Sao_Paulo')):%d/%m/%Y %H:%M %Z}"
-                            mid = send(token,text)
-                            if not isinstance(mid,int): raise ValueError('Missing Telegram message id')
-                            ids.append(mid); state['sent'][key] = mid; atomic(path,state)
-                            if test: return ids  # one explicit TESTE maximum
+                            key = _hash(base + [threshold])
+                            if key in state['sent']:
+                                notified.append(threshold)
+                                continue
+                            for offset in range(-3600, 3601) if state['sent'] else ():
+                                old = _hash([provider,entry.id,name,(reset + timedelta(seconds=offset)).isoformat(),threshold])
+                                if old in state['sent']:
+                                    state['sent'][key] = state['sent'][old]
+                                    notified.append(threshold)
+                                    break
+                        atomic(path, state)
+                        crossed = [t for t in thresholds if pct >= t]
+                        if not crossed: continue
+                        threshold = max(crossed)
+                        if notified and threshold <= max(notified): continue
+                        brand = 'Codex' if provider == 'openai-codex' else 'Anthropic'
+                        window = {'primary_window':'de 5 horas', 'five_hour':'de 5 horas',
+                                  'secondary_window':'semanal', 'seven_day':'semanal'}.get(name, name)
+                        when = reset.astimezone(ZoneInfo('America/Sao_Paulo'))
+                        text = f"{'TESTE ' if test else ''}Conta {label} do {brand} em {pct:g}% da janela {window}. Zera {when:%d/%m} às {when:%H:%M}."
+                        mid = send(token,text)
+                        if type(mid) is not int: raise ValueError('Missing Telegram message id')
+                        ids.append(mid)
+                        state['sent'][_hash(base + [threshold])] = mid
+                        atomic(path,state)
+                        if test: return ids
                 except Exception:
-                    # Do not log exceptions: HTTP exceptions may contain token-bearing URLs.
                     LOG.warning('Provider quota check/send unavailable')
         return ids
 
+
 def post_llm_call(*args, **kwargs):
     try:
-        from hermes_constants import get_hermes_home
+        from hermes_constants import get_default_hermes_root
+        root = Path(get_default_hermes_root())
+        owner = root/'provider-ops'/'alerts-owner'
+        if root != Path('/opt/manuella') or not owner.is_file() or owner.read_text() != 'manu':
+            return
         from gateway.platforms._shared import get_scoped_secret
-        home = get_hermes_home()
         token = get_scoped_secret('TELEGRAM_BOT_TOKEN', '')
         context = contextvars.copy_context()
         def work():
-            try: context.run(check,home,token)
+            try: context.run(check,root,token)
             except Exception: LOG.warning('Provider quota worker unavailable')
         threading.Thread(target=work,daemon=True,name='provider-quota').start()
     except Exception: LOG.warning('Provider quota hook unavailable')
