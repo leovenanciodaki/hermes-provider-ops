@@ -6,12 +6,16 @@ No inference calls, cron, credential rotation, model changes, or priority change
 
 ## Delivery status
 
-**Partial implementation; not deployment ready.** Quota plugin and hermetic tests
-work locally. The deterministic rollout entrypoint deliberately exits nonzero and
-writes explicit UNVERIFIED results: full installation-specific backup, Docker build,
-cleanup, readiness, acceptance, service transaction, and rollback adapters are not
-implemented. This includes Tanque. No SSH, deployment, Telegram traffic, API model
-calls, commits, or pushes were performed. No real TESTE message ID exists.
+**Partial rollout; the fleet script is not deployment ready.** The quota plugin is
+installed on Manu and Luna at code ref `5ae26cfb31f548c769c960b89241963ff9380bd1`.
+Both run Hermes 0.23.1, with connected platforms and one local API turn returning
+`FROTA_OK` each. One forced-low TESTE alert was delivered, Telegram message 3893,
+and its unchanged text was verified. Mafe and Aquario were rolled back to their
+previous images after Docker API incompatibility and executor timeout respectively.
+No existing third-party/user plugin was upgraded or unified. The deterministic
+rollout entrypoint still deliberately exits nonzero: its transaction adapters,
+including Tanque, are not implemented. Do not execute it as a working installer.
+Bot integration remains undeployed. No Tanque deployment was performed.
 
 The Docker helper refuses contracts it cannot preserve. It is not a complete Docker
 recreation engine and must not be used alone to recreate either production container.
