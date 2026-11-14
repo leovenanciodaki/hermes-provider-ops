@@ -115,7 +115,8 @@ def native_install(cli, release, ref, home, prefix=(), legacy_present=None):
     env=['env','HOME='+str(base.parent),'HERMES_HOME='+str(base)]
     # Native Git installer clones ONLY the local pinned release, while gateways remain up.
     if legacy_present if legacy_present is not None else has_legacy(home):
-        run([*prefix,*env,cli,'-p',profile,'plugins','disable','aquario-pool-fastrotate'])
+        try: run([*prefix,*env,cli,'-p',profile,'plugins','disable','aquario-pool-fastrotate'])
+        except Exception: pass  # only named in config, never installed here: nothing to disable
     run([*prefix,*env,cli,'-p',profile,'plugins','install','file://'+str(release),'--ref',ref,'--enable','--yes-deps','--force'],timeout=240)
 
 def clean(paths, boot):
