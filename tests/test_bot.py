@@ -20,3 +20,13 @@ class Bot(unittest.TestCase):
             self.assertTrue(app.update(self.update())['duplicate'])
             u=self.update();u['message']['from']['id']=1
             self.assertTrue(app.update(u)['ignored']);forward.assert_not_called()
+    def test_reply_sent_once_and_test_flag_strict(self):
+        import types
+        with patch.dict(sys.modules,{'hermes_cli':types.SimpleNamespace(kanban_db=object())}):
+            spec=importlib.util.spec_from_file_location('dispatcher_reply',Path(__file__).resolve().parents[1]/'bot/dispatcher.py');m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m)
+        for flag,prefix in [(True,True),('true',False),(False,False)]:
+            state={'updates':{},'messages':{},'sent':{},'decisions':{}}
+            app=m.Dispatcher('fake',state);u=self.update();u['provider_ops_test']=flag
+            with patch.object(m,'audit'),patch.object(app,'save'),patch.object(app,'send') as send,patch('provider_refresh.forward',return_value={'ok':True,'result':'manu: liberado\nmafe: sem pool'}) as forward:
+                app.update(u);app.update(u);send.assert_called_once();forward.assert_called_once()
+                text=send.call_args.args[0];self.assertEqual(text.startswith('TESTE'),prefix);self.assertIn('luna: falhou:',text)

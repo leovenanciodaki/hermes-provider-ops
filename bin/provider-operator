@@ -1,23 +1,25 @@
 #!/usr/bin/env python3
-"""Fixed host routes configured outside Git; all installations run concurrently."""
+"""Five fixed installations, concurrent bounded subprocesses; no inference."""
 import concurrent.futures,json,subprocess,sys
 from pathlib import Path
-sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'scripts'))
-from local_ops import diagnostic
-
+NAMES=('manu','mafe','luna','aquario','tanque')
 def invoke(row,provider):
-    argv=row['argv']
-    if not isinstance(argv,list) or not argv or not all(isinstance(x,str) for x in argv):return row['name']+': falhou:invalid argv'
+    name=row['name'];argv=row.get('argv')
+    if not isinstance(argv,list) or not argv or not all(isinstance(x,str) for x in argv) or not argv[0].startswith('/'):
+        return name+': falhou:invalid route'
     try:
         p=subprocess.run(argv+[provider],capture_output=True,text=True,timeout=40)
-        result=diagnostic(p.stderr or p.stdout)
-        return row['name']+': '+(('sem pool' if 'sem pool' in result and 'liberado' not in result else 'liberado') if p.returncode==0 else 'falhou:'+result)
-    except Exception as e:return row['name']+': falhou:'+diagnostic(e)
-
+        if p.returncode:return name+': falhou:unavailable'
+        values=[line.partition(':')[2].strip() for line in p.stdout.splitlines() if ':' in line]
+        if not values or any(v not in ('liberado','sem pool') for v in values):return name+': falhou:invalid result'
+        return name+': '+('liberado' if 'liberado' in values else 'sem pool')
+    except Exception:return name+': falhou:unavailable'
 def main():
     if len(sys.argv)!=2 or sys.argv[1] not in ('anthropic','openai'):return 2
-    rows=json.loads(Path('/etc/hermes-provider-ops-routes.json').read_text())['installations']
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1,len(rows))) as pool:
-        for line in pool.map(lambda row:invoke(row,sys.argv[1]),rows):print(line)
+    try:rows=json.loads(Path('/etc/hermes-provider-ops-routes.json').read_text())['installations']
+    except Exception:rows=[]
+    routes={r.get('name'):r for r in rows if isinstance(r,dict)}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as pool:
+        for line in pool.map(lambda name:invoke(routes.get(name,{'name':name}),sys.argv[1]),NAMES):print(line)
     return 0
 if __name__=='__main__':sys.exit(main())

@@ -21,6 +21,6 @@ def execute(q):
         try:
             p=subprocess.run(argv+[name],capture_output=True,text=True,timeout=45)
             out={'ok':p.returncode==0,'result':p.stdout[:8192]}
-        except subprocess.TimeoutExpired:out={'ok':False,'error':'operator deadline exceeded'}
+        except Exception:out={'ok':False,'error':'operator unavailable'}
         seen[uid]=out;tmp.write_text(json.dumps(seen));os.chmod(tmp,0o600);tmp.replace(path)
         return out

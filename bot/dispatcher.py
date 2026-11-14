@@ -204,7 +204,11 @@ class Dispatcher:
             text=(msg.get('text') or msg.get('caption') or '').strip()
             cmd=text.split()[0].split('@')[0] if text else ''
             from provider_refresh import provider, forward
-            if provider(u):out=forward(u,self.token)
+            if provider(u):
+                try:out=forward(u,self.token)
+                except Exception:out={'ok':False,'result':'manu: falhou:bridge unavailable\nmafe: falhou:bridge unavailable\nluna: falhou:bridge unavailable\naquario: falhou:bridge unavailable\ntanque: falhou:bridge unavailable'}
+                from provider_refresh import reply_text
+                self.send(reply_text(out,test=u.get('provider_ops_test') is True))
             elif cmd in ('/status','/start'):out=self.sync()
             elif msg.get('reply_to_message'):
                 reply=msg['reply_to_message'];entry=self.s['messages'].get(str(reply.get('message_id')))

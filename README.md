@@ -1,119 +1,80 @@
-# Hermes provider quota — 1.0.0
+# Hermes provider operations 1.1.0
 
-Native `post_llm_call` plugin written from scratch for Hermes v0.23.1
-`3b421578588243f920886e6fe79a6faa87ea026e`. Uses stdlib plus native Hermes imports.
-No inference calls, cron, credential rotation, model changes, or priority changes.
+Provider quota hook and transactional rollout source for Hermes v0.23.1,
+core `3b421578588243f920886e6fe79a6faa87ea026e`. This revision has not been
+deployed or verified on fleet hosts. Tests use fake transports; they prove local
+logic, not compatibility with every live installation.
 
-## Delivery status
+The quota hook uses native credential pools read-only, with per-profile throttling,
+threshold deduplication and bounded notifications. Refresh uses native auth reset;
+it does not call a model. Explicit test notifications have a `TESTE` prefix.
 
-**Partial rollout; the fleet script is not deployment ready.** The quota plugin is
-installed on Manu and Luna at code ref `5ae26cfb31f548c769c960b89241963ff9380bd1`.
-Both run Hermes 0.23.1, with connected platforms and one local API turn returning
-`FROTA_OK` each. One forced-low TESTE alert was delivered, Telegram message 3893,
-and its unchanged text was verified. Mafe and Aquario were rolled back to their
-previous images after Docker API incompatibility and executor timeout respectively.
-No existing third-party/user plugin was upgraded or unified. The deterministic
-rollout entrypoint still deliberately exits nonzero: its transaction adapters,
-including Tanque, are not implemented. Do not execute it as a working installer.
-Bot integration remains undeployed. No Tanque deployment was performed.
+## Rollout
 
-The Docker helper refuses contracts it cannot preserve. It is not a complete Docker
-recreation engine and must not be used alone to recreate either production container.
-Bot source copies preserve the original dispatcher and bridge except the refresh
-branch; host integration, fixed route configuration, ownership validation, and
-end-to-end transport have not been verified. No configuration containing secrets
-is included. Refresh results are returned through the authenticated bridge response;
-the dispatcher does not currently send those results as a Telegram reply.
-
-## Native installation
-
-Once this repository has been published at a real commit SHA:
+Publish the intended repository commit first. `REF` must be its exact lowercase
+40-hex SHA, present in the local Git repository. Working-tree edits are not the
+plugin release. Private artifacts must be outside this repository.
 
 ```sh
-hermes plugins install https://github.com/leovenanciodaki/hermes-provider-ops --ref SHA --enable --yes-deps --force
+python scripts/rollout.py --repo-ref REF --artifacts /private/provider-results --detach
+python scripts/rollout.py --repo-ref REF --target mafe --artifacts /private/provider-results --status /tmp/hermes-provider-ops-mafe-JOB
+python scripts/rollout.py --repo-ref REF --target mafe --artifacts /private/provider-results --rollback /tmp/hermes-provider-ops-mafe-JOB --detach
 ```
 
-`SHA` must be replaced with the actual repository commit. This pass did not create
-one. The root manifest is installable; installation itself does not apply the core
-patch. `scripts/install.py --core CORE --cli NATIVE_HERMES --repo-ref SHA` prechecks
-both core file hashes and applies the two-file patch before native plugin installation.
-A caller must first create the required backup. Installation is not transactional.
-The installer does not yet retire fastrotate from the enabled list or remove obsolete
-artifacts. Do not treat it as the requested complete rollout.
+Default targets: manu, mafe, luna, aquario. Tanque is excluded unless explicitly
+selected with `--target tanque`; its adapter covers hermes-carla and hermes-ana.
+`--image sha256:…` overrides the Docker derivative. Mafe/Aquario default to the
+specified staged images, checked against native version/core identity and both
+patched file hashes. Without a staged image, the adapter builds a derivative of
+the installation's old image using the pinned core archive, preserving runtime
+directories and writing an install stamp. Docker HTTP requests use v1.45.
 
-## Quota behavior
+A local Git bundle carries the pinned plugin release. Native plugin install and
+legacy disable run before stopping gateways. Only provider-ops is installed; only
+named legacy artifacts are removed. Docker Config, HostConfig and network creation
+options are preserved, including User, resources and unrelated mounts. Configs,
+provider plugin directories, mounted boot file and selected legacy files have a
+private tar backup; sessions and general backups are excluded. The old container
+remains available for rollback. Manu and Luna patch idempotently and restart their
+native service when code changes. Host jobs detach, writing job.log, result.json
+and exit-code. Local polling does not own job lifetime.
 
-The hook captures profile home, contextvars, and native gateway scoped Telegram
-secret before starting a daemon thread. Per-profile flock and atomic state writes
-limit scans to once per 300 seconds across processes. Each pool account uses its
-exact runtime key and base URL. Anthropic OAuth usage is fetched directly with native
-headers; utilization is already percent, including values below 1. Codex uses native
-`fetch_account_usage(read_only=True)` and raw `rate_limit` windows. Unsupported or
-invalid windows are skipped. Notifications to Leo `7414371088` include account label,
-percent, and reset in America/Sao_Paulo. Deduplication covers provider, account ID,
-window, reset, and threshold (85/95). Failed sends remain eligible on the next scan.
+Readiness requires fresh gateway state, a new process identity, version 0.23.1,
+and the baseline connected platforms for every previously active home. Preexisting
+fatal platforms are not required to recover. Docker readiness has a 200-second
+budget, leaving time for an optional API turn and rollback. `--accept-turns`
+explicitly authorizes one local OpenAI-compatible API turn per installation; its
+output is private. API settings use native gateway configuration and secret scope.
+Failure restores the tar and restarts the old installation. Host commands, service
+permissions, API routing and timing still require an operator-reviewed live trial.
 
-`provider_ops.check(..., test=True, thresholds=(...), fetch=..., send=...)` is the
-explicit injectable helper. A test invocation sends at most one prefixed `TESTE`
-notification and returns its actual Telegram message ID. Tests use only fake senders.
-Normal callbacks never select test mode. State is stored under each profile's
-`provider-ops/`, with separate test state.
+## Refresh bot
 
-## Refresh and bot
+```sh
+python scripts/local_ops.py refresh anthropic --cli /absolute/native/hermes
+python scripts/local_ops.py refresh openai --cli /absolute/native/hermes
+```
 
-`scripts/local_ops.py refresh anthropic|openai --cli /absolute/native/hermes`
-uses native root semantics and invokes native `--profile NAME auth reset PROVIDER`
-for root/default and each configured profile. `openai` maps to `openai-codex`.
-The launcher needs the native runtime's `hermes_constants` available on PYTHONPATH
-or alongside the resolved CLI. It does not import native YAML through system Python.
-Diagnostics are bounded and redact common credential shapes; arbitrary provider
-error strings have not been exhaustively audited.
+Dispatcher preserves the existing sender/private-chat, duplicate and Kanban guards.
+Refresh forwards through the authenticated bridge, then sends one reply containing
+one line for each of manu, mafe, luna, aquario and tanque. Only the literal boolean
+`provider_ops_test: true` adds `TESTE`. Missing/unreachable installations report a
+bounded failure; subprocess diagnostics and credentials are not relayed.
 
-`bot/dispatcher.py` preserves original Leo sender/chat/private checks and duplicate
-guard before recognizing the two literal refresh commands. It forwards the original
-update and ephemeral token to the existing authenticated host bridge route.
-`bot/bridge.py` repeats validation; `bot/provider_host.py` persists a replay marker
-before invoking fixed configured operator argv, without forwarding `_token`.
-`bin/provider-operator` runs installation argv concurrently, with a 40-second process
-deadline inside a 45-second host operator deadline. Fixed argv must be provisioned
-outside Git in `/etc/hermes-provider-ops-routes.json`, with `operator_argv` and
-`installations: [{"name": "...", "argv": ["absolute executable", "fixed args"]}]`.
-No SSH keys or tokens belong in that file. Production route configuration is absent.
+Provision `/etc/hermes-provider-ops-routes.json` privately with `operator_argv`
+and `installations: [{"name":"manu","argv":["/absolute/fixed/launcher"]}, …]`.
+The operator runs five installations concurrently, each with a 40-second timeout.
+No token is passed to those subprocesses. Existing bridge functions remain intact.
+`python scripts/deploy_bot.py SOURCE DEST --preimage-sha256 HASH` is an optional
+local atomic-copy helper with a preimage guard and backup. It was not run.
 
-## Native cooldown patch evidence
-
-`tests/native_reset.py` reproduced the clean-runtime defect using one pre-existing
-simulated live agent and real native CredentialPool objects plus native auth-store
-writes. Both account cooldown and model-only cooldown remain blocked after reset.
-`tests/native_patched.py` executes the generated patched helper in isolation and
-checks that the same agent restores after reset using a fresh available native pool.
-Only downstream runtime installation is mocked, preventing inference or client calls.
-
-The new patch stamps arm wall time and requires a newer native `status_cleared_at`,
-matching primary provider/base URL, a matching reset account ID, and availability
-for the primary model. No marker means no early clear. `patches/manifest.json`
-archives exact pre/post SHA256. The read-only reference was never changed.
-
-## Hermetic checks
+## Tests
 
 ```sh
 python -m unittest discover -s tests -p 'test_*.py'
-PYTHONPATH=../frota-hermes-upstream ../frota-hermes/.cache/test-env/bin/python tests/native_reset.py
-PYTHONPATH=../frota-hermes-upstream ../frota-hermes/.cache/test-env/bin/python tests/native_patched.py
+python -m py_compile scripts/*.py bot/*.py bin/provider-operator
 ```
 
-No entire Hermes suite is run. Seven standalone tests and two native test methods
-cover percent handling, per-profile throttling/deduplication, send retries, explicit
-single test alerts, unauthorized/duplicate bot commands, and the native reset gates.
-
-## Rollout command contract
-
-```sh
-./scripts/rollout.py --repo-ref SHA --artifacts /private/provider-ops-results
-./scripts/rollout.py --repo-ref SHA --target tanque --artifacts /private/tanque-results
-```
-
-Default order is Manu, Mafe, Luna, Aquario; `all` excludes Tanque. `--accept-turns`
-and `--test-alert` are parsed but cannot execute while transaction adapters are absent.
-Every target records missing acceptance and the explicit error; no remote operations
-occur. Tanque is **not implemented or verified**, and its explicit command fails closed.
+Hermetic tests cover quota behavior, strict bot guards/replies, Docker recipe
+preservation, baseline readiness, legacy scan exclusions, exact restore, local
+native install ordering, worker routes, failed-cut rollback and safe diagnostics.
