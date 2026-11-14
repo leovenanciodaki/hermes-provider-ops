@@ -1,0 +1,28 @@
+--- agent/agent_runtime_helpers.py
++++ agent/agent_runtime_helpers.py
+@@ -1420,6 +1420,25 @@
+         return loaded if loaded is not None and _matches_primary(loaded) else None
+     if _primary_quota_reopened_early(agent, primary_provider, primary_model, _matches_primary, _load_primary_pool):
+         agent._rate_limited_until = 0
++    if getattr(agent, "_rate_limited_until", 0) > time.monotonic():
++        # Explicit native reset after this session's arm, for this primary route only.
++        try:
++            from hermes_cli.auth import read_credential_pool
++            armed = getattr(agent, "_provider_ops_cooldown_armed_at", 0)
++            fresh = _load_primary_pool() if armed else None
++            rows = read_credential_pool(primary_provider) if fresh is not None else []
++            reset_ids = {row.get("id") for row in rows
++                         if isinstance(row, dict) and isinstance(row.get("status_cleared_at"), (int, float))
++                         and row["status_cleared_at"] > armed
++                         and row["status_cleared_at"] > (row.get("last_status_at") or 0)}
++            if fresh is not None and reset_ids:
++                with fresh._lock:
++                    available, _ = fresh._available_entries(model=primary_model or None)
++                if any(entry.id in reset_ids for entry in available):
++                    agent._credential_pool = fresh
++                    agent._rate_limited_until = 0
++        except Exception:
++            pass
+     if getattr(agent, "_rate_limited_until", 0) > time.monotonic():
+         return False  # primary still in rate-limit cooldown, stay on fallback
+     blocked, prefetched_pool, prefetched = _primary_reset_gate_blocks(

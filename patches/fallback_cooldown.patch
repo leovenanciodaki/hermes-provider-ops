@@ -1,0 +1,10 @@
+--- agent/fallback_cooldown.py
++++ agent/fallback_cooldown.py
+@@ -68,6 +68,7 @@
+     else:
+         backoff_seconds = min(60 * (2 ** backoff_count), 14400)
+         source = "exponential fallback"
++    agent._provider_ops_cooldown_armed_at = time.time()
+     agent._rate_limited_until = time.monotonic() + backoff_seconds
+     logging.info(
+         "Rate-limit backoff level %d: cooldown %d s (%.1f min, backoff#%d, %s)",

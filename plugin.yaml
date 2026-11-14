@@ -1,0 +1,5 @@
+name: provider-ops
+version: "1.0.0"
+description: "Read-only per-account provider quota notifications"
+provides_hooks:
+  - post_llm_call
