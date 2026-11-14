@@ -8,14 +8,9 @@ from install import apply_patch
 SHA='3b421578588243f920886e6fe79a6faa87ea026e'
 STAGED={'aquario':'sha256:909aab930cdc786c0a65624ab183916d49b9b3137a9962ea9141b15769d926a5','mafe':'sha256:c1c56809ca97db6d2ce4862dabda6c8cda270cb54f6291bab4c42e4f9231bc3f'}
 NAMES={'aquario':['hermes-agent-l0fn2jx4qutmcpf774xsi6no'],'mafe':['hermes-mafe'],'tanque':['hermes-carla','hermes-ana']}
-EXCLUDE={'cache','sessions','logs','backups','.git','skills','node_modules','.venv','__pycache__','provider-ops-backups','frota-backups'}
+EXCLUDE={'cache','sessions','logs','backups','.git','skills','node_modules','.venv','__pycache__','provider-ops-backups','frota-backups','backup','old-backups'}
 LEGACY={'aquario-pool-fastrotate','anthropic_pool_overlay_20261114','anthropic-rescue-20261110'}
-def run(argv, timeout=120, **kw):
-    p=subprocess.run([str(x) for x in argv],capture_output=True,text=True,timeout=timeout,**kw)
-    if p.returncode:
-        private(Path.cwd()/'last-command-error.private.json',{'program':Path(str(argv[0])).name,'returncode':p.returncode,'stderr':p.stderr[-5000:],'stdout':p.stdout[-5000:]})
-        raise RuntimeError('Command failed: '+Path(str(argv[0])).name)
-    return p.stdout.strip()
+from rollout_support import run, log, redact, exception, LIMIT, STAGING_LIMIT
 def private(path, obj):
     path=Path(path); temp=path.with_suffix('.tmp')
     temp.write_text(json.dumps(obj,indent=2));temp.chmod(0o600);temp.replace(path)
@@ -23,7 +18,7 @@ def legacy(roots):
     found=[]
     for root in roots:
         for base, dirs, files in os.walk(root,followlinks=False):
-            dirs[:]=[d for d in dirs if d not in EXCLUDE]
+            dirs[:]=[d for d in dirs if d not in EXCLUDE and 'backup' not in d.lower()]
             for leaf in list(dirs)+files:
                 if leaf in LEGACY or leaf.startswith('anthropic_pool_unlatch'):
                     found.append(Path(base)/leaf)
@@ -31,14 +26,48 @@ def legacy(roots):
     return list(dict.fromkeys(found))
 def homes(root):
     return [root]+sorted(p for p in (root/'profiles').glob('*') if (p/'config.yaml').exists())
+def selected_size(paths):
+    entries={}
+    for p in paths:
+        p=Path(p)
+        candidates=[p] if not p.is_dir() or p.is_symlink() else p.rglob('*')
+        for child in candidates:
+            if child.is_file() and not child.is_symlink():entries[str(child)]=child.stat().st_size
+    return sum(entries.values()), sorted(entries.items(),key=lambda x:x[1],reverse=True)[:10]
+def disk_check(work, required=0):
+    free=shutil.disk_usage(work).free
+    log(f'disk_free={free} selected_backup={required}')
+    if free < required*2+128*1024*1024:raise RuntimeError('Insufficient disk space for backup and reserve')
+    return free
 def snapshot(paths, backup):
-    # Record absent paths too: rollback must remove newly created plugin/config files.
     paths=list(dict.fromkeys(Path(p) for p in paths))
+    size,largest=selected_size(paths)
+    disk_check(backup.parent,size)
+    if size>LIMIT:raise RuntimeError(f'Backup selected files exceed 100MiB: {largest}')
     private(str(backup)+'.paths', [str(p) for p in paths])
-    with tarfile.open(backup,'w:gz',compresslevel=1) as tar:
+    with tarfile.open(backup,'w:gz',compresslevel=1,dereference=False) as tar:
         for p in paths:
-            if p.exists() or p.is_symlink(): tar.add(p,arcname=str(p).lstrip('/'))
+            if p.exists() or p.is_symlink():tar.add(p,arcname=str(p).lstrip('/'))
     backup.chmod(0o600)
+    if backup.stat().st_size>LIMIT:
+        backup.unlink();raise RuntimeError(f'Compressed backup exceeds 100MiB: {largest}')
+def readback(root, ref):
+    result={}
+    for h in homes(root):
+        plugin=h/'plugins/provider-ops'
+        version=(plugin/'VERSION').read_text().strip()
+        installed=run(['git','-c','safe.directory='+str(plugin),'-C',plugin,'rev-parse','HEAD'])
+        if version!='1.1.1' or installed!=ref:raise RuntimeError(f'Plugin readback mismatch: {h} {version} {installed}')
+        remaining=legacy([h])
+        if remaining:raise RuntimeError(f'Legacy paths remain: {remaining}')
+        result[str(h)]={'version':version,'ref':installed,'legacy_verified':True}
+    return result
+def finish_backup(work, backup):
+    size=backup.stat().st_size
+    backup.unlink();Path(str(backup)+'.paths').unlink()
+    r=json.loads((work/'rollback.json').read_text());r.update(backup_deleted=True,backup_bytes=size)
+    private(work/'rollback.json',r)
+    return {'backup_bytes':size,'backup_deleted':True,'free_final':disk_check(work)}
 def restore(backup):
     for p in json.loads(Path(str(backup)+'.paths').read_text()):
         p=Path(p)
@@ -54,7 +83,7 @@ def states(root):
             if s.get('gateway_state') in ('running','starting','degraded'):result[str(h)]=s
     return result
 def connected(state):
-    return {k for k,v in state.get('platforms',{}).items() if v.get('state')=='connected'}
+    return {k for k,v in state.get('platforms',{}).items() if v.get('state')=='connected' and (v.get('writer_pid') is None or (v.get('writer_pid'),v.get('writer_start_time',v.get('start_time')))==(state.get('pid'),state.get('start_time')))}
 def ready(before, after, since):
     from datetime import datetime
     for h,b in before.items():
@@ -68,17 +97,19 @@ def wait_ready(before, root, since, deadline):
         after=states(root)
         if ready(before,after,since):return after
         time.sleep(2)
-    raise RuntimeError('Gateway readiness deadline')
+    raise RuntimeError('Gateway readiness deadline: '+json.dumps({h:{'missing_platforms':sorted(connected(b)-connected(after.get(h,{}))), 'state':after.get(h,{}), 'required_new_process': [b.get('pid'),b.get('start_time')]} for h,b in before.items()}))
 def has_legacy(home):
     config=home/'config.yaml'
     return (home/'plugins/aquario-pool-fastrotate').exists() or (config.exists() and 'aquario-pool-fastrotate' in config.read_text())
 
 def native_install(cli, release, ref, home, prefix=(), legacy_present=None):
-    env=['env','HERMES_HOME='+str(home)]
+    base=home.parent.parent if home.parent.name=='profiles' else home
+    profile=home.name if home.parent.name=='profiles' else 'default'
+    env=['env','HOME='+str(base.parent),'HERMES_HOME='+str(base)]
     # Native Git installer clones ONLY the local pinned release, while gateways remain up.
     if legacy_present if legacy_present is not None else has_legacy(home):
-        run([*prefix,*env,cli,'plugins','disable','aquario-pool-fastrotate'])
-    run([*prefix,*env,cli,'plugins','install','file://'+str(release),'--ref',ref,'--enable','--yes-deps','--force'],timeout=240)
+        run([*prefix,*env,cli,'-p',profile,'plugins','disable','aquario-pool-fastrotate'])
+    run([*prefix,*env,cli,'-p',profile,'plugins','install','file://'+str(release),'--ref',ref,'--enable','--yes-deps','--force'],timeout=240)
 
 def clean(paths, boot):
     for p in boot:
@@ -113,25 +144,32 @@ def image_for(d, target, image, work):
         # Keep runtime directories, replace every other core entry with pinned archive.
         run(['docker','start',stage])
         run(['docker','exec','-u','0',stage,'python3','-c',"import pathlib,shutil; r=pathlib.Path('/opt/hermes'); [(shutil.rmtree(p) if p.is_dir() and not p.is_symlink() else p.unlink()) for p in r.iterdir() if p.name not in {'.venv','.hermes','bin','node_modules'}]"])
+        size,largest=selected_size([core])
+        if size>=STAGING_LIMIT:raise RuntimeError(f'Container staging exceeds 50MiB: {largest}')
         run(['docker','cp',str(core)+'/.',stage+':/opt/hermes'])
         result=run(['docker','commit',stage]);verify_image(result);return result
     finally:run(['docker','rm','-f',stage])
 def docker_transaction(a,name,work):
     d=api('GET','/containers/'+quote(name)+'/json');root=Path(next(m['Source'] for m in d['Mounts'] if m['Destination']=='/home/hermes/.hermes'))
     before=states(root)
+    code="import json,pathlib; out={};\nfor p in pathlib.Path('/proc').iterdir():\n try: out[p.name]=int((p/'stat').read_text().rsplit(')',1)[1].split()[19])\n except (OSError,ValueError,IndexError): pass\nprint(json.dumps(out))"
+    processes=json.loads(run(['docker','exec',name,'python3','-c',code]))
+    before={h:s for h,s in before.items() if processes.get(str(s.get('pid')))==s.get('start_time')}
     if not before:raise RuntimeError('No active gateway baseline')
     boot=[Path(m['Source']) for m in d['Mounts'] if m['Destination']=='/opt/eveo-migration/boot-baseline.py']
     obsolete=legacy([root,Path('/srv/hermes-opt-data'),Path('/usr/local/sbin')])
     backup=work/'backup.tar.gz'; old=name+'-provider-ops-old-'+work.parent.name
-    image=image_for(d,a.target,a.image,work)
     paths=[*obsolete,*boot]
-    for h in homes(root):paths.extend([h/'config.yaml',h/'.env',h/'plugins/provider-ops',h/'plugins/aquario-pool-fastrotate'])
-    snapshot(paths,backup);private(work/'inspect.json',d)
-    private(work/'rollback.json',{'name':name,'old':old,'backup':str(backup)})
+    for h in homes(root):paths.extend([h/'config.yaml',h/'plugins/provider-ops',h/'plugins/aquario-pool-fastrotate'])
+    snapshot(paths,backup)
+    image=image_for(d,a.target,a.image,work)
+    private(work/'rollback.json',{'name':name,'old':old,'backup':str(backup),'previous_image_id':d['Image'],'previous_image_name':d['Config'].get('Image')})
     stopped=False;renamed=False;made=False
     try:
         # Copy one local Git release into live runtime. No network/dependencies at cut.
         release='/tmp/provider-ops-release-'+work.parent.name
+        release_size,_=selected_size([Path(__file__).resolve().parents[1]/'release'])
+        if release_size>=STAGING_LIMIT:raise RuntimeError('Container staging exceeds 50MiB')
         run(['docker','cp',str(Path(__file__).resolve().parents[1]/'release'),name+':'+release])
         runtime_user='1000:1000' if a.target=='aquario' else (d['Config'].get('User') or '0')
         run(['docker','exec','-u','0',name,'chown','-R',runtime_user,release])
@@ -141,29 +179,42 @@ def docker_transaction(a,name,work):
             native_install('/opt/hermes/bin/hermes',Path(release),a.repo_ref,inside,
                 ['docker','exec','-u',runtime_user,name],legacy_present=has_legacy(h))
         clean(obsolete,boot)
-        since=time.time();deadline=time.monotonic()+200
+        import rollout_support
+        since=time.time();cutover_deadline=time.monotonic()+240;rollout_support.DEADLINE=cutover_deadline
         run(['docker','stop','-t','20',name],timeout=30);stopped=True
         run(['docker','rename',name,old]);renamed=True
         api('POST','/containers/create?name='+quote(name),recipe(d,image));made=True
         run(['docker','start',name],timeout=20)
-        after=wait_ready(before,root,since,deadline)
-        if a.accept_turns:accept_turn(root,name,work)
-        return {'ok':True,'before':{h:sorted(connected(s)) for h,s in before.items()},'after':{h:sorted(connected(s)) for h,s in after.items()},'rollback':str(work),'image':image,'turn':'accepted' if a.accept_turns else 'not requested'}
+        after=wait_ready(before,root,since,min(cutover_deadline-40,time.monotonic()+180))
+        if a.accept_turns:accept_turn(root,name,work,deadline=cutover_deadline)
+        run(['docker','exec','-u','0',name,'rm','-rf',release])
+        plugin_readback=readback(root,a.repo_ref)
+        backup_result=finish_backup(work,backup)
+        import rollout_support
+        rollout_support.DEADLINE=None
+        return {'ok':True,**backup_result,'plugins':plugin_readback,'before':{h:{'platforms':sorted(connected(s)),'code_sha':s.get('code_sha'),'code_version':s.get('code_version')} for h,s in before.items()},'after':{h:{'platforms':sorted(connected(s)),'code_sha':s.get('code_sha'),'code_version':s.get('code_version')} for h,s in after.items()},'rollback':str(work),'image':image,'turn':'accepted' if a.accept_turns else 'not requested'}
     except BaseException:
-        if made:run(['docker','rm','-f',name],timeout=20)
-        restore(backup)
-        if renamed:run(['docker','rename',old,name],timeout=15)
-        if stopped:run(['docker','start',name],timeout=20)
+        import rollout_support
+        rollout_support.DEADLINE=None
+        log(exception())
+        actions=[]
+        if made:actions.append(lambda:run(['docker','rm','-f',name],timeout=20))
+        actions.append(lambda:restore(backup))
+        if renamed:actions.append(lambda:run(['docker','rename',old,name],timeout=15))
+        if stopped:actions.append(lambda:run(['docker','start',name],timeout=20))
+        for action in actions:
+            try:action()
+            except BaseException:log(exception())
         raise
 
-def accept_turn(root, container, work):
+def accept_turn(root, container, work, deadline=None):
     code=Path(__file__).with_name('turn_probe.py').read_text()
     candidates=[h for h,s in states(root).items() if 'api_server' in connected(s)]
     if not candidates:raise RuntimeError('No connected local API server')
     home=Path(candidates[0])
     inside=Path('/home/hermes/.hermes')/home.relative_to(root) if container else home
     argv=['docker','exec','-i','-u','1000' if container=='hermes-agent-l0fn2jx4qutmcpf774xsi6no' else (api('GET','/containers/'+quote(container)+'/json')['Config'].get('User') or '0'),'-e','HERMES_HOME='+str(inside),container,'/opt/hermes/.venv/bin/python','-'] if container else ['env','HERMES_HOME='+str(home),str(CORE_PY(root)),'-']
-    output=run(argv,input=code,timeout=45)
+    output=run(argv,input=code,timeout=min(225,max(1,deadline-time.monotonic())) if deadline else 225)
     private(work/'turn.json',json.loads(output.splitlines()[-1]))
 
 def CORE_PY(root):
@@ -178,22 +229,31 @@ def service_transaction(a,work):
     manifest=json.loads((Path(__file__).resolve().parents[1]/'patches/manifest.json').read_text())
     changed=any(hashlib.sha256((core/r['path']).read_bytes()).hexdigest()!=r['after'] for r in manifest['files'])
     paths=[core/r['path'] for r in manifest['files']]
-    for h in homes(root):paths.extend([h/'config.yaml',h/'.env',h/'plugins/provider-ops',h/'plugins/aquario-pool-fastrotate'])
+    for h in homes(root):paths.extend([h/'config.yaml',h/'plugins/provider-ops',h/'plugins/aquario-pool-fastrotate'])
     obsolete=legacy([root]);paths+=obsolete
     backup=work/'backup.tar.gz';snapshot(paths,backup)
     restart=['sudo','-n','systemctl','restart','hermes-manuella'] if manu else ['launchctl','kickstart','-k','gui/'+str(os.getuid())+'/ai.hermes.gateway']
     private(work/'rollback.json',{'backup':str(backup),'restart':restart})
+    cutover_deadline=time.monotonic()+240
     try:
         old_plugin=root/'plugins/provider-ops'
         same=old_plugin.exists() and run(['git','-C',old_plugin,'rev-parse','HEAD'])==a.repo_ref
         for h in homes(root):native_install(cli,Path(__file__).resolve().parents[1]/'release',a.repo_ref,h)
         apply_patch(core);clean(obsolete,[])
         if changed or not same:
-            since=time.time();run(restart);wait_ready(before,root,since,time.monotonic()+240)
-        if a.accept_turns:accept_turn(root,None,work)
-        return {'ok':True,'changed':changed or not same,'rollback':str(work),'turn':'accepted' if a.accept_turns else 'not requested'}
+            import rollout_support
+            since=time.time();cutover_deadline=time.monotonic()+240;rollout_support.DEADLINE=cutover_deadline
+            run(restart,timeout=20);wait_ready(before,root,since,min(cutover_deadline-40,time.monotonic()+180))
+        if a.accept_turns:accept_turn(root,None,work,deadline=cutover_deadline)
+        plugin_readback=readback(root,a.repo_ref)
+        backup_result=finish_backup(work,backup)
+        import rollout_support
+        rollout_support.DEADLINE=None
+        return {'ok':True,**backup_result,'plugins':plugin_readback,'before':before,'after':states(root),'changed':changed or not same,'rollback':str(work),'turn':'accepted' if a.accept_turns else 'not requested'}
     except BaseException:
-        restore(backup);run(restart);raise
+        import rollout_support
+        rollout_support.DEADLINE=None
+        log(exception());restore(backup);run(restart,timeout=45);raise
 
 def rollback(work):
     if not (work/'rollback.json').exists():
@@ -201,6 +261,7 @@ def rollback(work):
             if child.is_dir() and (child/'rollback.json').exists():rollback(child)
         return
     r=json.loads((work/'rollback.json').read_text())
+    if r.get('backup_deleted'):raise RuntimeError('Installation backup deleted; automatic rollback unavailable; previous image/container retained')
     if 'name' in r:
         run(['docker','rm','-f',r['name']]);restore(Path(r['backup']))
         run(['docker','rename',r['old'],r['name']]);run(['docker','start',r['name']])
@@ -211,6 +272,7 @@ def main():
     (work/'result.json').unlink(missing_ok=True)
     (work/'exit-code').unlink(missing_ok=True)
     try:
+        disk_check(work)
         if a.rollback:rollback(work);result={'ok':True,'rolled_back':True}
         elif a.target in NAMES:
             result={'ok':True,'installations':[]}
@@ -218,6 +280,7 @@ def main():
                 sub=work/name;sub.mkdir(exist_ok=True);result['installations'].append(docker_transaction(a,name,sub))
         else:result=service_transaction(a,work)
         code=0
-    except BaseException as e:result={'ok':False,'error':type(e).__name__};code=1
+    except BaseException as e:
+        detail=exception();log(detail);result={'ok':False,'error':redact(str(e)),'traceback':detail};code=1
     private(work/'result.json',result);(work/'exit-code').write_text(str(code));return code
 if __name__=='__main__':sys.exit(main())

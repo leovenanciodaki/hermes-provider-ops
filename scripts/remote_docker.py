@@ -1,4 +1,5 @@
 """Lossless Docker v1.45 recreation recipe; no daemon access on import."""
+from rollout_support import redact, log
 import copy
 import http.client
 import json
@@ -18,7 +19,8 @@ def api(method, path, payload=None):
         c.request(method, '/v1.45'+path, json.dumps(payload) if payload is not None else None,
                   {'Content-Type':'application/json'})
         r=c.getresponse(); data=r.read()
-        if r.status >= 300: raise RuntimeError('Docker HTTP '+str(r.status))
+        if r.status >= 300:
+            message=redact(f'Docker {method} {path} HTTP {r.status}: {data.decode(errors="replace")}');log(message);raise RuntimeError(message)
         return json.loads(data) if data else {}
     finally: c.close()
 
@@ -30,6 +32,6 @@ def recipe(inspect, image):
     endpoints={}
     for name, endpoint in inspect['NetworkSettings']['Networks'].items():
         endpoints[name]={k:copy.deepcopy(endpoint[k]) for k in
-            ('IPAMConfig','Links','Aliases','DriverOpts','GwPriority') if endpoint.get(k) is not None}
+            ('IPAMConfig','Links','Aliases','DriverOpts') if endpoint.get(k) is not None}
     payload['NetworkingConfig']={'EndpointsConfig':endpoints}
     return payload
