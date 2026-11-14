@@ -5,6 +5,8 @@ from gateway.config import load_gateway_config, Platform
 from hermes_constants import get_hermes_home
 from agent.secret_scope import get_secret
 home=Path(get_hermes_home())
+from dotenv import load_dotenv
+load_dotenv(home/'.env',override=False)
 # A model acceptance must not generate quota Telegram notifications.
 import time
 for candidate in [home]+list((home/'profiles').glob('*')):
@@ -19,7 +21,7 @@ key=extra.get('key') or get_secret('API_SERVER_KEY','') or os.environ.get('API_S
 port=int(extra.get('port') or os.environ.get('API_SERVER_PORT','8642'))
 if not key:raise RuntimeError('Local API authentication unavailable')
 request=urllib.request.Request('http://127.0.0.1:'+str(port)+'/v1/chat/completions',
-    data=json.dumps({'model':'hermes','messages':[{'role':'user','content':'Reply exactly FROTA_OK'}],'stream':False}).encode(),
+    data=json.dumps({'model':'hermes-agent','messages':[{'role':'user','content':'Reply exactly FROTA_OK'}],'stream':False}).encode(),
     headers={'Content-Type':'application/json','Authorization':'Bearer '+key})
 with urllib.request.urlopen(request,timeout=40) as response:result=json.load(response)
 text=result['choices'][0]['message']['content']

@@ -162,9 +162,9 @@ def accept_turn(root, container, work):
     if not candidates:raise RuntimeError('No connected local API server')
     home=Path(candidates[0])
     inside=Path('/home/hermes/.hermes')/home.relative_to(root) if container else home
-    argv=['docker','exec','-i','-e','HERMES_HOME='+str(inside),container,'/opt/hermes/.venv/bin/python','-'] if container else ['env','HERMES_HOME='+str(home),str(CORE_PY(root)),'-']
+    argv=['docker','exec','-i','-u','1000' if container=='hermes-agent-l0fn2jx4qutmcpf774xsi6no' else (api('GET','/containers/'+quote(container)+'/json')['Config'].get('User') or '0'),'-e','HERMES_HOME='+str(inside),container,'/opt/hermes/.venv/bin/python','-'] if container else ['env','HERMES_HOME='+str(home),str(CORE_PY(root)),'-']
     output=run(argv,input=code,timeout=45)
-    private(work/'turn.json',json.loads(output))
+    private(work/'turn.json',json.loads(output.splitlines()[-1]))
 
 def CORE_PY(root):
     return Path('/opt/manuella/runtime/.venv/bin/python') if str(root).startswith('/opt/manuella') else Path('/Volumes/LeoNvme/hermes-local/versions/v0.23.0/hermes-agent/.venv/bin/python')
