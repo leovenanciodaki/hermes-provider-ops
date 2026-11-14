@@ -13,7 +13,7 @@ LEGACY={'aquario-pool-fastrotate','anthropic_pool_overlay_20261114','anthropic-r
 def run(argv, timeout=120, **kw):
     p=subprocess.run([str(x) for x in argv],capture_output=True,text=True,timeout=timeout,**kw)
     if p.returncode:
-        private(Path.cwd()/'last-command-error.private.json',{'program':Path(str(argv[0])).name,'returncode':p.returncode,'stderr':p.stderr[-5000:]})
+        private(Path.cwd()/'last-command-error.private.json',{'program':Path(str(argv[0])).name,'returncode':p.returncode,'stderr':p.stderr[-5000:],'stdout':p.stdout[-5000:]})
         raise RuntimeError('Command failed: '+Path(str(argv[0])).name)
     return p.stdout.strip()
 def private(path, obj):
@@ -122,7 +122,7 @@ def docker_transaction(a,name,work):
     if not before:raise RuntimeError('No active gateway baseline')
     boot=[Path(m['Source']) for m in d['Mounts'] if m['Destination']=='/opt/eveo-migration/boot-baseline.py']
     obsolete=legacy([root,Path('/srv/hermes-opt-data'),Path('/usr/local/sbin')])
-    backup=work/'backup.tar.gz'; old=name+'-provider-ops-old-'+work.name
+    backup=work/'backup.tar.gz'; old=name+'-provider-ops-old-'+work.parent.name
     image=image_for(d,a.target,a.image,work)
     paths=[*obsolete,*boot]
     for h in homes(root):paths.extend([h/'config.yaml',h/'.env',h/'plugins/provider-ops',h/'plugins/aquario-pool-fastrotate'])
@@ -131,7 +131,7 @@ def docker_transaction(a,name,work):
     stopped=False;renamed=False;made=False
     try:
         # Copy one local Git release into live runtime. No network/dependencies at cut.
-        release='/tmp/provider-ops-release-'+work.name
+        release='/tmp/provider-ops-release-'+work.parent.name
         run(['docker','cp',str(Path(__file__).resolve().parents[1]/'release'),name+':'+release])
         runtime_user='1000:1000' if a.target=='aquario' else (d['Config'].get('User') or '0')
         run(['docker','exec','-u','0',name,'chown','-R',runtime_user,release])
