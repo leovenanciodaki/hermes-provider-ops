@@ -35,7 +35,7 @@ def snapshot(paths, backup):
     # Record absent paths too: rollback must remove newly created plugin/config files.
     paths=list(dict.fromkeys(Path(p) for p in paths))
     private(str(backup)+'.paths', [str(p) for p in paths])
-    with tarfile.open(backup,'w:gz') as tar:
+    with tarfile.open(backup,'w:gz',compresslevel=1) as tar:
         for p in paths:
             if p.exists() or p.is_symlink(): tar.add(p,arcname=str(p).lstrip('/'))
     backup.chmod(0o600)
