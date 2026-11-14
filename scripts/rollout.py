@@ -89,7 +89,7 @@ def main():
             else:
                 remote(target,['test','-x','/usr/bin/python3'])
                 if target in ('mafe','tanque'):
-                    helper="import os,sys,tarfile; os.umask(0o077); p='/host'+sys.argv[1]; os.makedirs(p); os.chown(p,int(sys.argv[2]),int(sys.argv[3])); tarfile.open(fileobj=sys.stdin.buffer,mode='r|gz').extractall(p,filter='data'); [os.chown(os.path.join(b,n),int(sys.argv[2]),int(sys.argv[3])) for b,ds,fs in os.walk(p) for n in ds+fs]"
+                    helper="import os,sys,tarfile; os.umask(0o077); p='/host'+sys.argv[1]; os.makedirs(p); os.chmod('/host/var/lib/hermes-provider-ops',0o711); os.chmod('/host/var/lib/hermes-provider-ops/jobs',0o711); os.chown(p,int(sys.argv[2]),int(sys.argv[3])); tarfile.open(fileobj=sys.stdin.buffer,mode='r|gz').extractall(p,filter='data'); [os.chown(os.path.join(b,n),int(sys.argv[2]),int(sys.argv[3])) for b,ds,fs in os.walk(p) for n in ds+fs]"
                     uid=remote(target,['id','-u']).decode().strip();gid=remote(target,['id','-g']).decode().strip()
                     remote(target,['sudo','-n','docker','run','--rm','-i','--network','none','-v','/:/host','--entrypoint','python3',a.image or 'sha256:c1c56809ca97db6d2ce4862dabda6c8cda270cb54f6291bab4c42e4f9231bc3f','-c',helper,job,uid,gid],input=payload)
                 else:
