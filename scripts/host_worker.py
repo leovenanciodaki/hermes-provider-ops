@@ -154,6 +154,7 @@ def image_for(d, target, image, work):
         run(['docker','exec','-u','0',stage,'python3','-c',"import pathlib,shutil; r=pathlib.Path('/opt/hermes'); [(shutil.rmtree(p) if p.is_dir() and not p.is_symlink() else p.unlink()) for p in r.iterdir() if p.name not in {'.venv','.hermes','bin','node_modules'}]"])
         size,largest=selected_size([core])
         if size>=STAGING_LIMIT:raise RuntimeError(f'Container staging exceeds 50MiB: {largest}')
+        run(['chmod','-R','a+rX',str(core)])  # job umask is private; the image needs world-readable/executable core
         run(['docker','cp',str(core)+'/.',stage+':/opt/hermes'])
         result=run(['docker','commit',stage]);verify_image(result);return result
     finally:run(['docker','rm','-f',stage])
