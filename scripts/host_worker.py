@@ -21,7 +21,14 @@ def legacy(roots):
             dirs[:]=[d for d in dirs if d not in EXCLUDE and 'backup' not in d.lower()]
             for leaf in list(dirs)+files:
                 if leaf in LEGACY or leaf.startswith('anthropic_pool_unlatch'):
-                    found.append(Path(base)/leaf)
+                    candidate=Path(base)/leaf
+                    # Historical snapshots are data, not executable overlay code.
+                    # Preserve them in place; never copy or delete old databases.
+                    protected=[p for p in candidate.iterdir() if 'backup' in p.name.lower()] if candidate.is_dir() and not candidate.is_symlink() else []
+                    if protected:
+                        log('Preserving historical legacy backup data in place: '+', '.join(str(p) for p in protected))
+                        found.extend(p for p in candidate.iterdir() if p not in protected)
+                    else:found.append(candidate)
                     if leaf in dirs: dirs.remove(leaf)
     return list(dict.fromkeys(found))
 def homes(root):

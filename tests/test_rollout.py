@@ -91,6 +91,17 @@ class BoundedRollout(unittest.TestCase):
     def test_stale_platform_writer(self):
         self.assertEqual(w.connected({'pid':1,'start_time':2,'platforms':{'telegram':{'state':'connected','writer_pid':9,'writer_start_time':2}}}),set())
 
+    def test_historical_legacy_data_is_not_copied_or_deleted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp); legacy=root/'anthropic-rescue-20261110'; saved=legacy/'backup'
+            saved.mkdir(parents=True); (saved/'state.db').write_text('historical data')
+            code=legacy/'apply_overlay.py';code.write_text('old code')
+            selected=w.legacy([root]); self.assertEqual(selected,[code])
+            archive=root/'minimal.tar.gz';w.snapshot(selected,archive)
+            self.assertLess(archive.stat().st_size,1024*1024)
+            w.clean(selected,[]);self.assertEqual((saved/'state.db').read_text(),'historical data')
+            self.assertEqual(w.legacy([root]),[])
+            w.restore(archive);self.assertEqual(code.read_text(),'old code')
     def test_port_discovery(self):
         from turn_probe import discover_port
         self.assertEqual(discover_port({'platforms':{'api_server':{'metrics':{'port':9001}}}},1),9001)
