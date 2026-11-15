@@ -246,7 +246,7 @@ def docker_transaction(a,name,work):
         clean(obsolete,boot)
         import rollout_support
         since=time.time();cutover_deadline=time.monotonic()+(900 if a.target=='aquario' else 240);rollout_support.DEADLINE=cutover_deadline
-        run(['docker','stop','-t','20',name],timeout=30);stopped=True
+        stopped=True;run(['docker','stop','-t','60',name],timeout=120)
         run(['docker','rename',name,old]);renamed=True
         api('POST','/containers/create?name='+quote(name),recipe(d,image));made=True
         run(['docker','start',name],timeout=20)
