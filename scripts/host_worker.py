@@ -241,12 +241,12 @@ def docker_transaction(a,name,work):
                 ['docker','exec','-u',runtime_user,name],legacy_present=has_legacy(h))
         clean(obsolete,boot)
         import rollout_support
-        since=time.time();cutover_deadline=time.monotonic()+(600 if a.target=='aquario' else 240);rollout_support.DEADLINE=cutover_deadline
+        since=time.time();cutover_deadline=time.monotonic()+(900 if a.target=='aquario' else 240);rollout_support.DEADLINE=cutover_deadline
         run(['docker','stop','-t','20',name],timeout=30);stopped=True
         run(['docker','rename',name,old]);renamed=True
         api('POST','/containers/create?name='+quote(name),recipe(d,image));made=True
         run(['docker','start',name],timeout=20)
-        after=wait_ready(before,root,since,min(cutover_deadline-40,time.monotonic()+(300 if a.target=='aquario' else 180)))
+        after=wait_ready(before,root,since,min(cutover_deadline-40,time.monotonic()+(600 if a.target=='aquario' else 180)))
         if a.accept_turns:accept_turn(root,name,work,deadline=cutover_deadline)
         run(['docker','exec','-u','0',name,'rm','-rf',release])
         plugin_readback=readback(root,a.repo_ref)
