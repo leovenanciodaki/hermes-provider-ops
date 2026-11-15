@@ -134,7 +134,7 @@ def clean(paths, boot):
 EXECUTABLE_INVENTORY="""import json,os,stat
 out={}
 for base,dirs,files in os.walk('/opt/hermes',followlinks=False):
- dirs[:]=sorted(d for d in dirs if d not in {'.venv','.hermes','bin','node_modules'})
+ dirs[:]=sorted(d for d in dirs if d not in {'.venv','.hermes','bin','node_modules','uv-cache','__pycache__'})
  for name in sorted(files):
   p=os.path.join(base,name); mode=os.lstat(p).st_mode
   if stat.S_ISREG(mode) and mode & 0o111: out[os.path.relpath(p,'/opt/hermes')]=mode & 0o111
