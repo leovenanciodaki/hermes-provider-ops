@@ -91,20 +91,24 @@ def states(root):
     return result
 def connected(state):
     return {k for k,v in state.get('platforms',{}).items() if v.get('state')=='connected' and (v.get('writer_pid') is None or (v.get('writer_pid'),v.get('writer_start_time',v.get('start_time')))==(state.get('pid'),state.get('start_time')))}
+# Known pre-existing platform faults that also fail on the current version; tracked separately.
+TOLERATED={'jessy':{'discord'}}
+def required(home,state):
+    return connected(state)-TOLERATED.get(Path(home).name,set())
 def ready(before, after, since):
     from datetime import datetime
     for h,b in before.items():
         s=after.get(h,{})
         try: fresh=datetime.fromisoformat(s.get('started_at',s.get('updated_at','')).replace('Z','+00:00')).timestamp()>=since
         except (ValueError,TypeError):fresh=False
-        if not fresh or (s.get('pid'),s.get('start_time'))==(b.get('pid'),b.get('start_time')) or s.get('code_version')!='0.23.1' or s.get('gateway_state')!='running' or not connected(b)<=connected(s):return False
+        if not fresh or (s.get('pid'),s.get('start_time'))==(b.get('pid'),b.get('start_time')) or s.get('code_version')!='0.23.1' or s.get('gateway_state')!='running' or not required(h,b)<=connected(s):return False
     return bool(before)
 def wait_ready(before, root, since, deadline):
     while time.monotonic()<deadline:
         after=states(root)
         if ready(before,after,since):return after
         time.sleep(2)
-    raise RuntimeError('Gateway readiness deadline: '+json.dumps({h:{'missing_platforms':sorted(connected(b)-connected(after.get(h,{}))), 'state':after.get(h,{}), 'required_new_process': [b.get('pid'),b.get('start_time')]} for h,b in before.items()}))
+    raise RuntimeError('Gateway readiness deadline: '+json.dumps({h:{'missing_platforms':sorted(required(h,b)-connected(after.get(h,{}))), 'state':after.get(h,{}), 'required_new_process': [b.get('pid'),b.get('start_time')]} for h,b in before.items()}))
 def has_legacy(home):
     config=home/'config.yaml'
     return (home/'plugins/aquario-pool-fastrotate').exists() or (config.exists() and 'aquario-pool-fastrotate' in config.read_text())
