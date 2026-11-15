@@ -126,13 +126,63 @@ def clean(paths, boot):
     for p in paths:
         if p.is_dir() and not p.is_symlink():shutil.rmtree(p)
         elif p.exists() or p.is_symlink():p.unlink()
-def verify_image(image):
+# Never follow symlinks or traverse runtime directories when copying source modes.
+EXECUTABLE_INVENTORY="""import json,os,stat
+out={}
+for base,dirs,files in os.walk('/opt/hermes',followlinks=False):
+ dirs[:]=sorted(d for d in dirs if d not in {'.venv','.hermes','bin','node_modules'})
+ for name in sorted(files):
+  p=os.path.join(base,name); mode=os.lstat(p).st_mode
+  if stat.S_ISREG(mode) and mode & 0o111: out[os.path.relpath(p,'/opt/hermes')]=mode & 0o111
+print(json.dumps(out,sort_keys=True))
+"""
+REPAIR_EXECUTABLES="""import json,pathlib,stat,sys
+root=pathlib.Path('/opt/hermes'); expected=json.loads(sys.argv[1])
+for name,bits in expected.items():
+ p=root/name
+ if not p.exists() or any(parent.is_symlink() for parent in [p,*p.parents]): continue
+ mode=p.lstat().st_mode
+ if stat.S_ISREG(mode):
+  p.chmod((stat.S_IMODE(mode) & ~0o111) | bits)
+  assert p.stat().st_mode & 0o111 == bits, name
+"""
+def repair_executables(current, stage):
+    inventory=run(['docker','run','--rm','--network','none','--entrypoint','python3',current,'-c',EXECUTABLE_INVENTORY])
+    run(['docker','exec','-u','0',stage,'python3','-c',REPAIR_EXECUTABLES,inventory])
+
+def smoke_image(image):
+    # Pinned dispatcher -> /init -> main-wrapper.sh passes executable CMD through.
+    # No host mounts: tmpfs and any image-declared anonymous volumes are disposable.
+    container=run(['docker','create','--network','none','--tmpfs','/opt/data:rw',
+        '-e','HERMES_HOME=/opt/data',image,'/bin/true'])
+    try:
+        run(['docker','start','-a',container],timeout=60)
+        if run(['docker','inspect','--format','{{.State.ExitCode}}',container])!='0':
+            raise RuntimeError('Default entrypoint smoke test failed')
+    finally:run(['docker','rm','-f','-v',container],timeout=20)
+
+def verify_core_image(image):
     code="import hashlib,json,pathlib; m=json.loads(pathlib.Path('/release/patches/manifest.json').read_text()); assert all(hashlib.sha256((pathlib.Path('/opt/hermes')/r['path']).read_bytes()).hexdigest()==r['after'] for r in m['files']); import hermes_cli; from hermes_cli.version_info import get_code_identity; assert get_code_identity()['version']=='0.23.1' and get_code_identity()['sha']=='3b421578588243f920886e6fe79a6faa87ea026e'"
     run(['docker','run','--rm','--network','none','--user','0','-w','/opt/hermes','-v',str(Path(__file__).resolve().parents[1])+':/release:ro','--entrypoint','/opt/hermes/.venv/bin/python',image,'-c',code])
+
+def verify_image(image):
+    verify_core_image(image)
+    smoke_image(image)
 def image_for(d, target, image, work):
     candidate=image or STAGED.get(target)
     if candidate:
-        verify_image(candidate);return candidate
+        if target!='aquario':
+            verify_image(candidate);return candidate
+        # Verify pinned contents before repairing the staged source's known mode bug.
+        verify_core_image(candidate)
+        stage=run(['docker','create','--entrypoint','/bin/sleep',candidate,'infinity'])
+        try:
+            run(['docker','start',stage])
+            repair_executables(d['Image'],stage)
+            result=run(['docker','commit','--change','ENTRYPOINT '+json.dumps(d['Config']['Entrypoint']),
+                '--change','CMD '+json.dumps(d['Config']['Cmd']),stage])
+            verify_image(result);return result
+        finally:run(['docker','rm','-f',stage])
     import urllib.request
     archive=work/'core.tar.gz'
     urllib.request.urlretrieve('https://github.com/NousResearch/hermes-agent/archive/'+SHA+'.tar.gz',archive)
@@ -156,7 +206,9 @@ def image_for(d, target, image, work):
         if size>=STAGING_LIMIT:raise RuntimeError(f'Container staging exceeds 50MiB: {largest}')
         run(['chmod','-R','a+rX',str(core)])  # job umask is private; the image needs world-readable/executable core
         run(['docker','cp',str(core)+'/.',stage+':/opt/hermes'])
-        result=run(['docker','commit',stage]);verify_image(result);return result
+        repair_executables(d['Image'],stage)
+        result=run(['docker','commit','--change','ENTRYPOINT '+json.dumps(d['Config']['Entrypoint']),
+            '--change','CMD '+json.dumps(d['Config']['Cmd']),stage]);verify_image(result);return result
     finally:run(['docker','rm','-f',stage])
 def docker_transaction(a,name,work):
     d=api('GET','/containers/'+quote(name)+'/json');root=Path(next(m['Source'] for m in d['Mounts'] if m['Destination']=='/home/hermes/.hermes'))
@@ -189,12 +241,12 @@ def docker_transaction(a,name,work):
                 ['docker','exec','-u',runtime_user,name],legacy_present=has_legacy(h))
         clean(obsolete,boot)
         import rollout_support
-        since=time.time();cutover_deadline=time.monotonic()+240;rollout_support.DEADLINE=cutover_deadline
+        since=time.time();cutover_deadline=time.monotonic()+(600 if a.target=='aquario' else 240);rollout_support.DEADLINE=cutover_deadline
         run(['docker','stop','-t','20',name],timeout=30);stopped=True
         run(['docker','rename',name,old]);renamed=True
         api('POST','/containers/create?name='+quote(name),recipe(d,image));made=True
         run(['docker','start',name],timeout=20)
-        after=wait_ready(before,root,since,min(cutover_deadline-40,time.monotonic()+180))
+        after=wait_ready(before,root,since,min(cutover_deadline-40,time.monotonic()+(300 if a.target=='aquario' else 180)))
         if a.accept_turns:accept_turn(root,name,work,deadline=cutover_deadline)
         run(['docker','exec','-u','0',name,'rm','-rf',release])
         plugin_readback=readback(root,a.repo_ref)
