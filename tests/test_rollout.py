@@ -10,10 +10,10 @@ class Rollout(unittest.TestCase):
     def test_contract_preserved(self):
         d={'Config':{'User':'root','Env':['SECRET=x'],'Labels':{'x':'y'},'Entrypoint':['a','b']},'HostConfig':{'Binds':['/old:/opt/hermes/tools/delegate_tool.py:ro'],'Memory':234,'Mounts':[{'Type':'tmpfs'}],'CapAdd':['SYS_PTRACE']},'NetworkSettings':{'Networks':{'net':{'Aliases':['alias'],'EndpointID':'stale','IPAMConfig':{'IPv4Address':'10.0.0.2'}}}}}
         p=recipe(d,'new');self.assertEqual(p['HostConfig'],d['HostConfig']);self.assertEqual(p['User'],'root');self.assertNotIn('EndpointID',p['NetworkingConfig']['EndpointsConfig']['net']);p['HostConfig']['Memory']=0;self.assertEqual(d['HostConfig']['Memory'],234)
-    def test_baseline_only_and_fresh_process(self):
+    def test_advisory_readiness_does_not_require_new_pid_or_platforms(self):
         b={'h':{'pid':1,'start_time':1,'platforms':{'telegram':{'state':'fatal'},'api_server':{'state':'connected'}}}}
         s={'pid':2,'start_time':2,'gateway_state':'running','code_version':'0.23.1','updated_at':'2026-11-14T01:00:00+00:00','platforms':{'api_server':{'state':'connected'}}}
-        self.assertTrue(w.ready(b,{'h':s},0));s['pid']=1;s['start_time']=1;self.assertFalse(w.ready(b,{'h':s},0));s['pid']=2;s['platforms']={};self.assertFalse(w.ready(b,{'h':s},0))
+        self.assertTrue(w.ready(b,{'h':s},0));s['pid']=1;s['start_time']=1;self.assertTrue(w.ready(b,{'h':s},0));s['pid']=2;s['platforms']={};self.assertTrue(w.ready(b,{'h':s},0));s['code_version']='0.23.0';self.assertFalse(w.ready(b,{'h':s},0))
     def test_scan_scope_and_exact_restore(self):
         with tempfile.TemporaryDirectory() as tmp:
             r=Path(tmp);(r/'sessions').mkdir();(r/'sessions/anthropic_pool_unlatch.py').write_text('keep');old=r/'anthropic_pool_unlatch.py';old.write_text('original');absent=r/'new-plugin';backup=r/'backup.tar.gz'

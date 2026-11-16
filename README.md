@@ -39,14 +39,45 @@ remains available for rollback. Manu and Luna patch idempotently and restart the
 native service when code changes. Host jobs detach, writing job.log, result.json
 and exit-code. Local polling does not own job lifetime.
 
-Readiness requires fresh gateway state, a new process identity, version 0.23.1,
-and the baseline connected platforms for every previously active home. Preexisting
-fatal platforms are not required to recover. Docker readiness has a 200-second
-budget, leaving time for an optional API turn and rollback. `--accept-turns`
-explicitly authorizes one local OpenAI-compatible API turn per installation; its
-output is private. API settings use native gateway configuration and secret scope.
-Failure restores the tar and restarts the old installation. Host commands, service
-permissions, API routing and timing still require an operator-reviewed live trial.
+Acceptance always requires one authenticated local API turn plus a live gateway
+PID reporting version 0.23.1 from `/health/detailed`. It does **not** require a
+new PID, a fresh status file, or every messaging platform to reconnect. The old
+`--accept-turns` flag remains compatible but is no longer needed. Probe candidates
+come from configured homes even when their status is absent or stale; the first
+successful turn completes installation acceptance. The returned text must be
+nonempty, not necessarily the literal prompt marker. Startup/probe commands are
+bounded (up to 900 seconds for Aquario, 300 for other installations); a readiness
+or platform deadline alone never triggers rollback after a turn has responded.
+
+Platform observations older than job start or from a dead/replaced writer are
+ignored, including port hints. Preexisting disconnected/fatal platforms do not
+have to recover. Fresh platform regressions, plugin readback, cleanup or evidence
+write failures retain the new version, record the error and return **2** without
+retrying or restarting. Automatic rollback is reserved for failure to start the
+new gateway at all, or failure of every local API candidate to return a real turn.
+A start-command timeout first checks the API instead of assuming an outage.
+
+Each execution attempts the update once and, only for a total gateway failure,
+one rollback. A host-wide advisory lock prevents overlapping jobs even with
+`--force`; its persisted timestamp refuses another execution within **6 hours**
+unless `--force` is supplied. Status polling does not acquire this lock. Explicit
+rollback is also a new execution and needs `--force` during the cooldown. Workers
+use exit codes **0** (accepted), **1** (total failure; automatic rollback attempted),
+**2** (incomplete; no automatic rollback), **3** (cooldown/concurrent execution
+refused). The foreground operator preserves these codes; detached jobs expose
+`exit_code` in `result.json`. Foreground polling waits for the terminal result;
+a polling timeout returns 2 and leaves the detached worker alone, never success
+or an automatic retry. Explicit rollback uses a fresh execution identifier and
+`result-<execution-id>.json`, preserving the original job result. To inspect it,
+add the returned `--execution-id` to `--status JOB`. Only jobs staged with this
+worker revision support these execution-specific rollback result files.
+
+Legacy scans and executable inventory prune `uv-cache`, `.cache`, pip/uv and
+other tool caches before descending. Recursive ownership/permission changes are
+restricted to the pinned release/staged source, bounded below 50 MiB, not runtime
+caches. Docker uses `stop -t 60` with a 120-second command timeout, independent of
+readiness budgets. Host commands, service permissions, API routing and timing
+still require an operator-reviewed live trial; **no rollout was run for this PR**.
 
 ## Refresh bot
 
