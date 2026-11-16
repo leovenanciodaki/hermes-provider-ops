@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Private detached host transaction. Invoked by rollout, never on import."""
-import argparse, hashlib, json, os, shutil, subprocess, sys, tarfile, time
+import argparse, hashlib, json, os, re, shutil, subprocess, sys, tarfile, time
 from pathlib import Path
 from urllib.parse import quote
 from remote_docker import api, recipe
@@ -8,7 +8,42 @@ from install import apply_patch
 SHA='3b421578588243f920886e6fe79a6faa87ea026e'
 STAGED={'aquario':'sha256:909aab930cdc786c0a65624ab183916d49b9b3137a9962ea9141b15769d926a5','mafe':'sha256:c1c56809ca97db6d2ce4862dabda6c8cda270cb54f6291bab4c42e4f9231bc3f'}
 NAMES={'aquario':['hermes-agent-l0fn2jx4qutmcpf774xsi6no'],'mafe':['hermes-mafe'],'tanque':['hermes-carla','hermes-ana']}
-EXCLUDE={'cache','sessions','logs','backups','.git','skills','node_modules','.venv','__pycache__','provider-ops-backups','frota-backups','backup','old-backups'}
+CACHE_DIRS={'cache','.cache','uv-cache','pip-cache','.uv-cache','.pytest_cache','.mypy_cache','.ruff_cache'}
+EXCLUDE=CACHE_DIRS|{'sessions','logs','backups','.git','skills','node_modules','.venv','__pycache__','provider-ops-backups','frota-backups','backup','old-backups'}
+COOLDOWN=6*60*60
+class RetainedUpdate(RuntimeError):
+    """Incomplete update: keep the current version, never retry or restart."""
+class GatewayUnavailable(RuntimeError):pass
+class NoRealTurn(RuntimeError):pass
+class RolloutRefused(RuntimeError):
+    def __init__(self,message,active_job=None):
+        super().__init__(message);self.active_job=active_job
+
+def acquire_lock(work, force=False):
+    # One lock per host, not per target/job; hold the fd until result publication.
+    import fcntl
+    path=(work.parent if work.name.startswith('hermes-provider-ops-') else work.parent.parent)/'hermes-provider-ops.rollout.lock'
+    stream=path.open('a+')
+    try:
+        fcntl.flock(stream,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        stream.seek(0)
+        try:previous=json.loads(stream.read() or '{}')
+        except (ValueError,TypeError):
+            if not force:raise RolloutRefused('Rollout refused: invalid cooldown marker; inspect or use --force')
+            previous={}
+        now=time.time()
+        if not force and now-previous.get('started_at',0)<COOLDOWN:
+            raise RolloutRefused('Rollout refused: previous execution within 6h; use --force')
+        stream.seek(0);stream.truncate();json.dump({'started_at':now,'job':str(work),'pid':os.getpid()},stream)
+        stream.flush();os.fsync(stream.fileno());return stream
+    except BlockingIOError:
+        stream.seek(0)
+        try:active_job=json.loads(stream.read() or '{}').get('job')
+        except ValueError:active_job=None
+        stream.close();raise RolloutRefused('Rollout refused: another execution is active (even with --force)',active_job=active_job)
+    except BaseException:
+        stream.close();raise
+
 LEGACY={'aquario-pool-fastrotate','anthropic_pool_overlay_20261114','anthropic-rescue-20261110'}
 from rollout_support import run, log, redact, exception, LIMIT, STAGING_LIMIT
 def private(path, obj):
@@ -85,30 +120,74 @@ def states(root):
     result={}
     for h in homes(root):
         p=h/'gateway_state.json'
-        if p.exists():
+        try:
             s=json.loads(p.read_text())
-            if s.get('gateway_state') in ('running','starting','degraded'):result[str(h)]=s
+            if isinstance(s,dict) and s.get('gateway_state') in ('running','starting','degraded'):result[str(h)]=s
+        except (OSError,ValueError,TypeError):pass
     return result
-def connected(state):
-    return {k for k,v in state.get('platforms',{}).items() if v.get('state')=='connected' and (v.get('writer_pid') is None or (v.get('writer_pid'),v.get('writer_start_time',v.get('start_time')))==(state.get('pid'),state.get('start_time')))}
-# Known pre-existing platform faults that also fail on the current version; tracked separately.
-TOLERATED={'jessy':{'discord'}}
-def required(home,state):
-    return connected(state)-TOLERATED.get(Path(home).name,set())
-def ready(before, after, since):
+
+def timestamp(value):
     from datetime import datetime
-    for h,b in before.items():
-        s=after.get(h,{})
-        try: fresh=datetime.fromisoformat(s.get('started_at',s.get('updated_at','')).replace('Z','+00:00')).timestamp()>=since
-        except (ValueError,TypeError):fresh=False
-        if not fresh or (s.get('pid'),s.get('start_time'))==(b.get('pid'),b.get('start_time')) or s.get('code_version')!='0.23.1' or s.get('gateway_state')!='running' or not required(h,b)<=connected(s):return False
-    return bool(before)
+    try:return datetime.fromisoformat(value.replace('Z','+00:00')).timestamp()
+    except (ValueError,TypeError,AttributeError):return 0
+
+def connected(state, since=0.0, processes=None):
+    if timestamp(state.get('updated_at'))<since:return set()
+    def current(v):
+        pid=v.get('writer_pid',state.get('pid'))
+        start=v.get('writer_start_time',v.get('start_time',state.get('start_time')))
+        if processes is not None and processes.get(str(pid))!=start:return False
+        if v.get('writer_pid') is not None and (pid,start)!=(state.get('pid'),state.get('start_time')):return False
+        return not since or timestamp(v.get('updated_at',state.get('updated_at')))>=since
+    return {k for k,v in state.get('platforms',{}).items() if v.get('state')=='connected' and current(v)}
+
+def required(home,state):return connected(state)
+
+def ready(before, after, since):
+    # Advisory only. No requirement for a new PID or for messaging recovery.
+    return bool(after) and all(s.get('code_version')=='0.23.1' and s.get('gateway_state')=='running' and timestamp(s.get('updated_at'))>=since for s in after.values())
+
 def wait_ready(before, root, since, deadline):
+    after={}
     while time.monotonic()<deadline:
         after=states(root)
         if ready(before,after,since):return after
         time.sleep(2)
-    raise RuntimeError('Gateway readiness deadline: '+json.dumps({h:{'missing_platforms':sorted(required(h,b)-connected(after.get(h,{}))), 'state':after.get(h,{}), 'required_new_process': [b.get('pid'),b.get('start_time')]} for h,b in before.items()}))
+    raise RuntimeError('Gateway readiness deadline (advisory): '+json.dumps(after))
+
+PROCESS_CODE="""import json,pathlib
+out={}
+for p in pathlib.Path('/proc').iterdir():
+ try: out[p.name]=int((p/'stat').read_text().rsplit(')',1)[1].split()[19])
+ except (OSError,ValueError,IndexError): pass
+print(json.dumps(out))
+"""
+def process_table(container):
+    argv=['docker','exec',container,'python3','-c',PROCESS_CODE] if container else [sys.executable,'-c',PROCESS_CODE]
+    if not container and not Path('/proc').exists():
+        argv=[str(CORE_PY(Path('/Users/leonardovenancio/.hermes'))),'-c',"import json,psutil; from gateway.status import get_process_start_time; print(json.dumps({str(p.pid): get_process_start_time(p.pid) for p in psutil.process_iter()}))"]
+    return json.loads(run(argv))
+
+def baseline(root, container, since):
+    # Diagnostics must never prevent an update on their own.
+    try:
+        processes=process_table(container)
+        return {h:dict(s,platforms={k:v for k,v in s.get('platforms',{}).items() if k in connected(s,since=since,processes=processes)}) for h,s in states(root).items()}
+    except Exception:
+        log('Baseline unavailable (advisory): '+exception());return {}
+
+def platform_regressions(before, after, since, processes):
+    missing={}
+    for h,b in before.items():
+        s=after.get(h,{})
+        if timestamp(s.get('updated_at'))<since:continue
+        if processes is not None and processes.get(str(s.get('pid')))!=s.get('start_time'):continue
+        fresh={k:v for k,v in s.get('platforms',{}).items()
+               if timestamp(v.get('updated_at',s.get('updated_at')))>=since
+               and (v.get('writer_pid',s.get('pid')),v.get('writer_start_time',s.get('start_time')))==(s.get('pid'),s.get('start_time'))}
+        lost=(connected(b)-connected(dict(s,platforms=fresh),since,processes)) & fresh.keys()
+        if lost:missing[h]=sorted(lost)
+    return missing
 def has_legacy(home):
     config=home/'config.yaml'
     return (home/'plugins/aquario-pool-fastrotate').exists() or (config.exists() and 'aquario-pool-fastrotate' in config.read_text())
@@ -134,7 +213,7 @@ def clean(paths, boot):
 EXECUTABLE_INVENTORY="""import json,os,stat
 out={}
 for base,dirs,files in os.walk('/opt/hermes',followlinks=False):
- dirs[:]=sorted(d for d in dirs if d not in {'.venv','.hermes','bin','node_modules','uv-cache','__pycache__'})
+ dirs[:]=sorted(d for d in dirs if d not in {'.venv','.hermes','bin','node_modules','__pycache__', 'cache','.cache','uv-cache','pip-cache','.uv-cache','.pytest_cache','.mypy_cache','.ruff_cache'})
  for name in sorted(files):
   p=os.path.join(base,name); mode=os.lstat(p).st_mode
   if stat.S_ISREG(mode) and mode & 0o111: out[os.path.relpath(p,'/opt/hermes')]=mode & 0o111
@@ -216,11 +295,8 @@ def image_for(d, target, image, work):
     finally:run(['docker','rm','-f',stage])
 def docker_transaction(a,name,work):
     d=api('GET','/containers/'+quote(name)+'/json');root=Path(next(m['Source'] for m in d['Mounts'] if m['Destination']=='/home/hermes/.hermes'))
-    before=states(root)
-    code="import json,pathlib; out={};\nfor p in pathlib.Path('/proc').iterdir():\n try: out[p.name]=int((p/'stat').read_text().rsplit(')',1)[1].split()[19])\n except (OSError,ValueError,IndexError): pass\nprint(json.dumps(out))"
-    processes=json.loads(run(['docker','exec',name,'python3','-c',code]))
-    before={h:s for h,s in before.items() if processes.get(str(s.get('pid')))==s.get('start_time')}
-    if not before:raise RuntimeError('No active gateway baseline')
+    since=getattr(a,'job_started_at',time.time())
+    before=baseline(root,name,since)
     boot=[Path(m['Source']) for m in d['Mounts'] if m['Destination']=='/opt/eveo-migration/boot-baseline.py']
     obsolete=legacy([root,Path('/srv/hermes-opt-data'),Path('/usr/local/sbin')])
     backup=work/'backup.tar.gz'; old=name+'-provider-ops-old-'+work.parent.name
@@ -229,7 +305,7 @@ def docker_transaction(a,name,work):
     snapshot(paths,backup)
     image=image_for(d,a.target,a.image,work)
     private(work/'rollback.json',{'name':name,'old':old,'backup':str(backup),'previous_image_id':d['Image'],'previous_image_name':d['Config'].get('Image')})
-    stopped=False;renamed=False;made=False
+    stopped=False;renamed=False;made=False;turn_attempted=False;accepted=False
     try:
         # Copy one local Git release into live runtime. No network/dependencies at cut.
         release='/tmp/provider-ops-release-'+work.parent.name
@@ -244,24 +320,38 @@ def docker_transaction(a,name,work):
             native_install('/opt/hermes/bin/hermes',Path(release),a.repo_ref,inside,
                 ['docker','exec','-u',runtime_user,name],legacy_present=has_legacy(h))
         clean(obsolete,boot)
-        import rollout_support
-        since=time.time();cutover_deadline=time.monotonic()+(900 if a.target=='aquario' else 240);rollout_support.DEADLINE=cutover_deadline
         stopped=True;run(['docker','stop','-t','60',name],timeout=120)
         run(['docker','rename',name,old]);renamed=True
         api('POST','/containers/create?name='+quote(name),recipe(d,image));made=True
         run(['docker','start',name],timeout=20)
-        after=wait_ready(before,root,since,min(cutover_deadline-40,time.monotonic()+(600 if a.target=='aquario' else 180)))
-        if a.accept_turns:accept_turn(root,name,work,deadline=cutover_deadline)
+        turn_attempted=True;accept_turn(root,name,work,since=since);accepted=True
+        after=states(root)
+        regressions=platform_regressions(before,after,since,process_table(name))
+        if regressions:raise RetainedUpdate('Platform regressions (new version retained): '+json.dumps(regressions))
         run(['docker','exec','-u','0',name,'rm','-rf',release])
         plugin_readback=readback(root,a.repo_ref)
         backup_result=finish_backup(work,backup)
         import rollout_support
         rollout_support.DEADLINE=None
-        return {'ok':True,**backup_result,'plugins':plugin_readback,'before':{h:{'platforms':sorted(connected(s)),'code_sha':s.get('code_sha'),'code_version':s.get('code_version')} for h,s in before.items()},'after':{h:{'platforms':sorted(connected(s)),'code_sha':s.get('code_sha'),'code_version':s.get('code_version')} for h,s in after.items()},'rollback':str(work),'image':image,'turn':'accepted' if a.accept_turns else 'not requested'}
-    except BaseException:
+        return {'ok':True,**backup_result,'plugins':plugin_readback,'before':{h:{'platforms':sorted(connected(s)),'code_sha':s.get('code_sha'),'code_version':s.get('code_version')} for h,s in before.items()},'after':{h:{'platforms':sorted(connected(s)),'code_sha':s.get('code_sha'),'code_version':s.get('code_version')} for h,s in after.items()},'rollback':str(work),'image':image,'turn':'accepted'}
+    except BaseException as error:
         import rollout_support
         rollout_support.DEADLINE=None
         log(exception())
+        # A start command timeout is not proof of gateway failure. Probe once.
+        if made and not turn_attempted:
+            turn_attempted=True
+            try:accept_turn(root,name,work,since=since);accepted=True
+            except NoRealTurn as probe_error:error=probe_error;log(exception())
+            except Exception as probe_error:raise RetainedUpdate(str(probe_error)) from error
+        if accepted or not stopped or (made and not isinstance(error,NoRealTurn)):
+            raise RetainedUpdate(str(error)) from error
+        if stopped and not renamed and not made:
+            # A timed-out stop may have left the original gateway healthy.
+            try:running=api('GET','/containers/'+quote(name)+'/json').get('State',{}).get('Running')
+            except Exception as observation_error:raise RetainedUpdate(str(observation_error)) from error
+            if running is not False:raise RetainedUpdate('Stop did not establish an outage; original installation retained: '+str(error)) from error
+        # Only total failure to start/respond reaches the one restore below.
         actions=[]
         if made:actions.append(lambda:run(['docker','rm','-f',name],timeout=20))
         actions.append(lambda:restore(backup))
@@ -270,25 +360,50 @@ def docker_transaction(a,name,work):
         for action in actions:
             try:action()
             except BaseException:log(exception())
-        raise
+        raise GatewayUnavailable(str(error)) from error
 
-def accept_turn(root, container, work, deadline=None):
+def accept_turn(root, container, work, deadline=None, since=None):
     code=Path(__file__).with_name('turn_probe.py').read_text()
-    candidates=[h for h,s in states(root).items() if 'api_server' in connected(s)]
-    if not candidates:raise RuntimeError('No connected local API server')
-    home=Path(candidates[0])
-    inside=Path('/home/hermes/.hermes')/home.relative_to(root) if container else home
-    argv=['docker','exec','-i','-u','1000' if container=='hermes-agent-l0fn2jx4qutmcpf774xsi6no' else (api('GET','/containers/'+quote(container)+'/json')['Config'].get('User') or '0'),'-e','HERMES_HOME='+str(inside),container,'/opt/hermes/.venv/bin/python','-'] if container else ['env','HERMES_HOME='+str(home),str(CORE_PY(root)),'-']
-    output=run(argv,input=code,timeout=min(225,max(1,deadline-time.monotonic())) if deadline else 225)
-    private(work/'turn.json',json.loads(output.splitlines()[-1]))
+    # Status files only prioritize candidates. Missing/stale status never vetoes API.
+    candidates=list(dict.fromkeys([Path(h) for h,s in states(root).items() if 'api_server' in s.get('platforms',{})]+homes(root)))
+    deadline=deadline or time.monotonic()+(900 if container=='hermes-agent-l0fn2jx4qutmcpf774xsi6no' else 300)
+    since=since if since is not None else time.time()
+    errors=[];indeterminate=not candidates
+    user='1000' if container=='hermes-agent-l0fn2jx4qutmcpf774xsi6no' else ((api('GET','/containers/'+quote(container)+'/json')['Config'].get('User') or '0') if container else None)
+    for index,home in enumerate(candidates):
+        remaining=deadline-time.monotonic()
+        if remaining<=0:break
+        inside=Path('/home/hermes/.hermes')/home.relative_to(root) if container else home
+        budget=max(1,remaining/(len(candidates)-index))
+        env=['HERMES_HOME='+str(inside),'PROVIDER_OPS_PROBE_WAIT='+str(max(0,min(600,budget-65))),'PROVIDER_OPS_SINCE='+str(since)]
+        argv=['docker','exec','-i','-u',user,'-e',env[0],'-e',env[1],'-e',env[2],container,'/opt/hermes/.venv/bin/python','-'] if container else ['env',*env,str(CORE_PY(root)),'-']
+        try:
+            output=run(argv,input=code,timeout=int(min(remaining,max(65,budget))))
+            result=json.loads(output.splitlines()[-1])
+            if result.get('failure'):
+                errors.append(redact(str(result)))
+                if result['failure']!='api_unavailable':indeterminate=True
+                continue
+            if result.get('version')!='0.23.1' or not result.get('pid') or not result.get('output'):
+                raise RuntimeError('Invalid live API acceptance evidence')
+            try:private(work/'turn.json',dict(result,home=str(home)))
+            except OSError as error:raise RetainedUpdate('Live turn accepted; evidence write failed: '+str(error)) from error
+            if result.get('warnings'):raise RetainedUpdate('Live turn accepted; '+json.dumps(result['warnings']))
+            return result
+        except RetainedUpdate:raise
+        except Exception as error:
+            indeterminate=True;errors.append(redact(str(error)))
+    if indeterminate:raise RetainedUpdate('API acceptance indeterminate; version retained: '+json.dumps(errors))
+    raise NoRealTurn('No real local API turn responded: '+json.dumps(errors))
 
 def CORE_PY(root):
     return Path('/opt/manuella/runtime/.venv/bin/python') if str(root).startswith('/opt/manuella') else Path('/Volumes/LeoNvme/hermes-local/versions/v0.23.0/hermes-agent/.venv/bin/python')
 def service_transaction(a,work):
     manu=a.target=='manu';root=Path('/opt/manuella' if manu else '/Users/leonardovenancio/.hermes')
     core=Path('/opt/manuella/runtime' if manu else '/Volumes/LeoNvme/hermes-local/versions/v0.23.0/hermes-agent')
-    cli=core/'bin/hermes'; before=states(root)
-    if not before:raise RuntimeError('No active gateway baseline')
+    cli=core/'bin/hermes'
+    since=getattr(a,'job_started_at',time.time())
+    before=baseline(root,None,since)
     identity=run([str(core/'.venv/bin/python'),'-c',"from hermes_cli.version_info import get_code_identity; import json; print(json.dumps(get_code_identity()))"],cwd=core)
     if json.loads(identity).get('sha')!=SHA:raise RuntimeError('Core SHA mismatch')
     manifest=json.loads((Path(__file__).resolve().parents[1]/'patches/manifest.json').read_text())
@@ -299,26 +414,33 @@ def service_transaction(a,work):
     backup=work/'backup.tar.gz';snapshot(paths,backup)
     restart=['sudo','-n','systemctl','restart','hermes-manuella'] if manu else ['launchctl','kickstart','-k','gui/'+str(os.getuid())+'/ai.hermes.gateway']
     private(work/'rollback.json',{'backup':str(backup),'restart':restart})
-    cutover_deadline=time.monotonic()+240
+    restarted=False;turn_attempted=False;accepted=False
     try:
         old_plugin=root/'plugins/provider-ops'
         same=old_plugin.exists() and run(['git','-C',old_plugin,'rev-parse','HEAD'])==a.repo_ref
         for h in homes(root):native_install(cli,Path(__file__).resolve().parents[1]/'release',a.repo_ref,h)
         apply_patch(core);clean(obsolete,[])
         if changed or not same:
-            import rollout_support
-            since=time.time();cutover_deadline=time.monotonic()+240;rollout_support.DEADLINE=cutover_deadline
-            run(restart,timeout=20);wait_ready(before,root,since,min(cutover_deadline-40,time.monotonic()+180))
-        if a.accept_turns:accept_turn(root,None,work,deadline=cutover_deadline)
+            restarted=True;run(restart,timeout=60)
+        turn_attempted=True;accept_turn(root,None,work,since=since);accepted=True
+        regressions=platform_regressions(before,states(root),since,process_table(None))
+        if regressions:raise RetainedUpdate('Platform regressions (new version retained): '+json.dumps(regressions))
         plugin_readback=readback(root,a.repo_ref)
         backup_result=finish_backup(work,backup)
         import rollout_support
         rollout_support.DEADLINE=None
-        return {'ok':True,**backup_result,'plugins':plugin_readback,'before':before,'after':states(root),'changed':changed or not same,'rollback':str(work),'turn':'accepted' if a.accept_turns else 'not requested'}
-    except BaseException:
+        return {'ok':True,**backup_result,'plugins':plugin_readback,'before':before,'after':states(root),'changed':changed or not same,'rollback':str(work),'turn':'accepted'}
+    except BaseException as error:
         import rollout_support
         rollout_support.DEADLINE=None
-        log(exception());restore(backup);run(restart,timeout=45);raise
+        log(exception())
+        if restarted and not turn_attempted:
+            turn_attempted=True
+            try:accept_turn(root,None,work,since=since);accepted=True
+            except NoRealTurn as probe_error:error=probe_error;log(exception())
+            except Exception as probe_error:raise RetainedUpdate(str(probe_error)) from error
+        if accepted or not restarted or not isinstance(error,NoRealTurn):raise RetainedUpdate(str(error)) from error
+        restore(backup);run(restart,timeout=60);raise GatewayUnavailable(str(error)) from error
 
 def rollback(work):
     if not (work/'rollback.json').exists():
@@ -332,20 +454,35 @@ def rollback(work):
         run(['docker','rename',r['old'],r['name']]);run(['docker','start',r['name']])
     else:restore(Path(r['backup']));run(r['restart'])
 def main():
-    p=argparse.ArgumentParser();p.add_argument('--target',required=True);p.add_argument('--repo-ref',required=True);p.add_argument('--image');p.add_argument('--accept-turns',action='store_true');p.add_argument('--rollback',action='store_true');a=p.parse_args()
-    os.umask(0o077);work=Path.cwd()
-    (work/'result.json').unlink(missing_ok=True)
-    (work/'exit-code').unlink(missing_ok=True)
+    p=argparse.ArgumentParser();p.add_argument('--target',required=True);p.add_argument('--repo-ref',required=True);p.add_argument('--image');p.add_argument('--accept-turns',action='store_true',help='Compatibility flag; API acceptance is always required');p.add_argument('--rollback',action='store_true');p.add_argument('--force',action='store_true');p.add_argument('--execution-id');a=p.parse_args()
+    if a.execution_id and not re.fullmatch('[0-9a-f]{32}',a.execution_id):p.error('Invalid execution id')
+    os.umask(0o077);work=Path.cwd();a.job_started_at=time.time()
+    suffix='-'+a.execution_id if a.execution_id else ''
+    result_path=work/('result'+suffix+'.json');exit_path=work/('exit-code'+suffix)
+    try:lock=acquire_lock(work,a.force)
+    except RolloutRefused as e:
+        log(str(e))
+        if (a.execution_id or e.active_job!=str(work)) and not result_path.exists():
+            private(result_path,{'ok':False,'refused':True,'exit_code':3,'error':str(e)})
+            exit_path.write_text('3')
+        return 3
     try:
-        disk_check(work)
-        if a.rollback:rollback(work);result={'ok':True,'rolled_back':True}
-        elif a.target in NAMES:
-            result={'ok':True,'installations':[]}
-            for name in NAMES[a.target]:
-                sub=work/name;sub.mkdir(exist_ok=True);result['installations'].append(docker_transaction(a,name,sub))
-        else:result=service_transaction(a,work)
-        code=0
-    except BaseException as e:
-        detail=exception();log(detail);result={'ok':False,'error':redact(str(e)),'traceback':detail};code=1
-    private(work/'result.json',result);(work/'exit-code').write_text(str(code));return code
+        result_path.unlink(missing_ok=True)
+        exit_path.unlink(missing_ok=True)
+        try:
+            disk_check(work)
+            if a.rollback:rollback(work);result={'ok':True,'rolled_back':True}
+            elif a.target in NAMES:
+                result={'ok':True,'installations':[]}  # type: dict
+                for name in NAMES[a.target]:
+                    sub=work/name;sub.mkdir(exist_ok=True);result['installations'].append(docker_transaction(a,name,sub))
+            else:result=service_transaction(a,work)
+            code=0
+        except BaseException as e:
+            detail=exception();log(detail)
+            code=1 if isinstance(e,GatewayUnavailable) else 2
+            result={'ok':False,'partial':code==2,'automatic_rollback':code!=2,'error':redact(str(e)),'traceback':detail}
+        result['exit_code']=code
+        private(result_path,result);exit_path.write_text(str(code));return code
+    finally:lock.close()
 if __name__=='__main__':sys.exit(main())

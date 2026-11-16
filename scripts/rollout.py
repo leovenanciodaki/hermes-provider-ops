@@ -44,12 +44,14 @@ def bundle(ref):
         if sum(m.size for m in check)>=STAGING_LIMIT:raise RuntimeError('Uncompressed deployment payload exceeds 50MiB')
     return out.getvalue()
 
-def launch(target,job,ref,image,turns,rollback=False):
+def launch(target,job,ref,image,turns,rollback=False,force=False,execution_id=None):
     # Bootstrap image is independent of the upgrade image; tanque builds its own derivative.
     worker=['/usr/bin/python3',job+'/scripts/host_worker.py','--target',target,'--repo-ref',ref]
     if image:worker+=['--image',image]
     if turns:worker+=['--accept-turns']
     if rollback:worker+=['--rollback']
+    if force:worker+=['--force']
+    if execution_id:worker+=['--execution-id',execution_id]
     if target in ('mafe','tanque'):
         # Only sudo docker is needed. Host Python is verified before detachment.
         bootstrap="import os,sys; os.chroot('/host'); os.chdir(sys.argv[1]); os.execv('/usr/bin/python3',['/usr/bin/python3']+sys.argv[2:])"
@@ -57,18 +59,32 @@ def launch(target,job,ref,image,turns,rollback=False):
     elif target=='aquario':worker=['sudo','-n',*worker]
     code="import os,subprocess,sys; os.umask(0o077); os.chdir(sys.argv[1]); f=open('job.log','ab',buffering=0); p=subprocess.Popen(sys.argv[2:],stdin=subprocess.DEVNULL,stdout=f,stderr=f,start_new_session=True); print(p.pid)"
     return remote(target,['/usr/bin/python3','-c',code,job,*worker]).decode().strip()
-def status(target,job):
-    code="import pathlib,sys; p=pathlib.Path(sys.argv[1]); print((p/'result.json').read_text() if (p/'result.json').exists() else '{\"ok\":null,\"running\":true}')"
-    argv=['/usr/bin/python3','-c',code,job]
+def status(target,job,execution_id=None):
+    filename='result'+('-'+execution_id if execution_id else '')+'.json'
+    code="import pathlib,sys; p=pathlib.Path(sys.argv[1])/sys.argv[2]; print(p.read_text() if p.exists() else '{\"ok\":null,\"running\":true}')"
+    argv=['/usr/bin/python3','-c',code,job,filename]
     if target=='aquario':argv=['sudo','-n',*argv]
     # Result files belong to root for mafe; docker-only sudo reads them through chroot.
     if target in ('mafe','tanque'):
-        code="import pathlib,sys; p=pathlib.Path('/host'+sys.argv[1])/'result.json'; print(p.read_text() if p.exists() else '{\"ok\":null,\"running\":true}')"
-        argv=['sudo','-n','docker','run','--rm','--network','none','-v','/:/host:ro','--entrypoint','python3',remote(target,['sudo','-n','docker','inspect','--format','{{.Image}}','hermes-carla' if target=='tanque' else 'hermes-mafe']).decode().strip(),'-c',code,job]
+        code="import pathlib,sys; p=pathlib.Path('/host'+sys.argv[1])/sys.argv[2]; print(p.read_text() if p.exists() else '{\"ok\":null,\"running\":true}')"
+        argv=['sudo','-n','docker','run','--rm','--network','none','-v','/:/host:ro','--entrypoint','python3',remote(target,['sudo','-n','docker','inspect','--format','{{.Image}}','hermes-carla' if target=='tanque' else 'hermes-mafe']).decode().strip(),'-c',code,job,filename]
     return json.loads(remote(target,argv))
+def wait_result(target, job, execution_id=None, timeout=3600):
+    end=time.monotonic()+timeout
+    while True:
+        try:result=status(target,job,execution_id)
+        except Exception as error:result={'ok':None,'running':True,'poll_error':redact(str(error))}
+        if result.get('ok') is not None:return result
+        if time.monotonic()>=end:
+            return dict(result,ok=False,partial=True,exit_code=2,error='Worker still pending; left running without retry or rollback')
+        time.sleep(3)
+
 def main():
     p=argparse.ArgumentParser();p.add_argument('--repo-ref',required=True);p.add_argument('--target',choices=[*DEFAULT,'tanque','all'],default='all');p.add_argument('--accept-turns',action='store_true');p.add_argument('--artifacts',type=Path,required=True);p.add_argument('--image');p.add_argument('--detach',action='store_true');p.add_argument('--status',metavar='JOB');p.add_argument('--rollback',metavar='JOB')
+    p.add_argument('--force',action='store_true',help='Override the host 6h cooldown (not an active execution)')
+    p.add_argument('--execution-id',help='Execution identifier returned for an explicit rollback; use with --status')
     a=p.parse_args()
+    if a.execution_id and not re.fullmatch('[0-9a-f]{32}',a.execution_id):p.error('Invalid execution id')
     if not re.fullmatch('[0-9a-f]{40}',a.repo_ref):p.error('--repo-ref must be exact 40 lowercase hex')
     dest=a.artifacts.resolve()
     if dest==ROOT or ROOT in dest.parents:p.error('Artifacts must be outside repository')
@@ -76,16 +92,20 @@ def main():
     if (a.status or a.rollback) and a.target=='all':p.error('Job commands require one --target')
     for value in (a.status,a.rollback):
         if value and not re.fullmatch(r'(?:/tmp/hermes-provider-ops-|/var/lib/hermes-provider-ops/jobs/)[a-z0-9-]+',value):p.error('Invalid job path')
-    failed=False
+    failed=0
     payload=None if a.status or a.rollback else bundle(a.repo_ref)
     for target in DEFAULT if a.target=='all' else (a.target,):
         try:
             job=a.status or a.rollback or ('/tmp/hermes-provider-ops-' if target=='luna' else '/var/lib/hermes-provider-ops/jobs/')+target+'-'+uuid.uuid4().hex
-            if a.status:result=status(target,job)
+            if a.status:result=status(target,job,a.execution_id)
             elif a.rollback:
                 # Reuse the original private worker/artifacts and detach the restore too.
-                launch(target,job,a.repo_ref,a.image,False,rollback=True)
-                result={'ok':None,'job':job,'rollback':'started'}
+                execution_id=a.execution_id or uuid.uuid4().hex
+                pid=launch(target,job,a.repo_ref,a.image,False,rollback=True,force=a.force,execution_id=execution_id)
+                result={'ok':None,'job':job,'pid':pid,'rollback':'started','execution_id':execution_id}
+                if not a.detach:
+                    result=wait_result(target,job,execution_id)
+                    result.update(job=job,execution_id=execution_id)
             else:
                 remote(target,['test','-x','/usr/bin/python3'])
                 if target in ('mafe','tanque'):
@@ -99,20 +119,16 @@ def main():
                     remote(target,['sh','-c','umask 077; mkdir -p '+shlex.quote(job)+' && tar -xzf - -C '+shlex.quote(job)],input=payload)
                 remote(target,['git','clone',job+'/release.bundle',job+'/release'])
                 remote(target,['git','-C',job+'/release','checkout','--detach',a.repo_ref])
-                pid=launch(target,job,a.repo_ref,a.image,a.accept_turns)
+                pid=launch(target,job,a.repo_ref,a.image,a.accept_turns,force=a.force)
                 result={'ok':None,'job':job,'pid':pid}
                 if not a.detach:
-                    end=time.monotonic()+270
-                    while time.monotonic()<end:
-                        result=status(target,job)
-                        if result.get('ok') is not None:break
-                        time.sleep(3)
+                    result=wait_result(target,job)
                     result['job']=job
             (dest/(target+'.json')).write_text(json.dumps(result,indent=2))
-            failed |= result.get('ok') is False
+            if result.get('ok') is False:failed=max(failed,result.get('exit_code',1))
             print(target+': '+('falhou' if result.get('ok') is False else 'ok' if result.get('ok') else 'job '+job))
         except Exception as e:
-            failed=True;(dest/(target+'.json')).write_text(json.dumps({'ok':False,'error':redact(str(e)),'traceback':exception()}))
+            failed=max(failed,1);(dest/(target+'.json')).write_text(json.dumps({'ok':False,'error':redact(str(e)),'traceback':exception()}))
             log(target+': falhou:'+exception())
     return int(failed)
 if __name__=='__main__':sys.exit(main())
